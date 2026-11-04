@@ -110,7 +110,8 @@ class Settings(BaseSettings):
     rate_limit_code_executions_per_user: int = 30
     rate_limit_code_execution_window_seconds: int = 3600
     # Number of reverse proxies in front of the API that append to X-Forwarded-For.
-    # 0 = use the socket peer address. On Render, set 1 (see docs/DEPLOYMENT.md).
+    # 0 = use the socket peer address. Render (measured): 3, together with
+    # CLIENT_IP_HEADER=cf-connecting-ip (see docs/DEPLOYMENT.md).
     trusted_proxy_count: int = 0
     # Optional: read the client IP from a header set by the edge proxy itself
     # (e.g. "cf-connecting-ip" behind Cloudflare). Takes precedence over

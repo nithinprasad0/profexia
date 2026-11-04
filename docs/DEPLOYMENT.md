@@ -200,7 +200,7 @@ Requirements: Redis >= 6.2 (uses `GETDEL`), pub/sub enabled, TLS (`rediss://`) f
    | `REDIS_URL` | Upstash `rediss://default:<password>@<host>.upstash.io:6379` |
    | `CORS_ORIGINS` | your Vercel URL, e.g. `https://profexia.vercel.app` (decide the Vercel project name now; edit later if it differs) |
 
-   Already set by the Blueprint: `ENVIRONMENT=production`, `JWT_SECRET_KEY` (generated), `TRUSTED_PROXY_COUNT=1`, `REALTIME_BACKEND=redis`, token lifetimes, `RUN_MIGRATIONS_ON_STARTUP=true`.
+   Already set by the Blueprint: `ENVIRONMENT=production`, `JWT_SECRET_KEY` (generated), `CLIENT_IP_HEADER=cf-connecting-ip`, `TRUSTED_PROXY_COUNT=3`, `PROXY_DIAGNOSTICS=false`, `REALTIME_BACKEND=redis`, token lifetimes, `RUN_MIGRATIONS_ON_STARTUP=true`.
    Optional, add later under **Environment**: `CORS_ORIGIN_REGEX` (Vercel previews), `RAZORPAY_KEY_ID/SECRET/WEBHOOK_SECRET`, `JUDGE0_BASE_URL/API_KEY`, `LIVEKIT_URL/API_KEY/API_SECRET`. Unset providers simply return 503.
 
 4. Deploy. The service URL looks like `https://profexia-api.onrender.com` (Render may add a suffix if the name is taken).
@@ -310,7 +310,20 @@ Login, registration, refresh and code execution are rate limited (thresholds in 
 | `TRUSTED_PROXY_COUNT=N` | Use the N-th `X-Forwarded-For` entry from the right (entries further left are client-controlled) |
 | neither | Use the TCP peer address (local/docker) |
 
-Render serves `onrender.com` through Cloudflare, and reports suggest `X-Forwarded-For` arrives as `<client-sent>, <client>, <cloudflare-edge>`. If so, `TRUSTED_PROXY_COUNT=1` resolves to a **Cloudflare edge address shared by many users**. Do not guess: measure it with the diagnostic below.
+Render serves `onrender.com` through Cloudflare. Do not guess the chain: measure it with the diagnostic below.
+
+**Measured production configuration (2026-11-04)** — six requests, three with forged documentation-range headers, all consistent:
+
+| Observation | Result |
+| --- | --- |
+| `X-Forwarded-For` structure | `<client-sent entries>, <client>, <Cloudflare edge>, <Render internal (private)>` — 3 entries added by the platform |
+| Forged `X-Forwarded-For` entries | Appear only to the **left**; the client stays 3rd from the right |
+| Client-supplied `CF-Connecting-IP` | **Rejected by Cloudflare (403)** before reaching the app |
+| `CF-Connecting-IP` | Always present, public, equal to the 3rd entry from the right |
+| Client-supplied `True-Client-IP` / `X-Real-IP` | Overwritten / stripped by the platform |
+| Previous `TRUSTED_PROXY_COUNT=1` | Resolved to the **private Render internal address** — every user shared one per-IP rate-limit bucket |
+
+Configuration in use (and in `render.yaml`): **`CLIENT_IP_HEADER=cf-connecting-ip`** (primary), **`TRUSTED_PROXY_COUNT=3`** (fallback when the header is missing or invalid), **`PROXY_DIAGNOSTICS=false`**. After applying it, the diagnostic reported `resolved_equals_cf_connecting_ip: true` for all six cases, including the forged ones. Re-measure if Render or Cloudflare change their proxy setup.
 
 **Measure (privacy-safe):**
 
@@ -429,7 +442,7 @@ Not yet verified against live Razorpay — see *Remaining issues* in the project
 - [ ] Admin account promoted with `create_admin`
 - [ ] (If used) Razorpay webhook URL + secret configured; test payment in test mode
 - [ ] (If used) Judge0 and LiveKit credentials set and exercised once
-- [ ] Client IP verified with the diagnostic in [Rate limiting and client IPs](#rate-limiting-and-client-ips); `PROXY_DIAGNOSTICS` back to `false`
+- [ ] Client IP verified with the diagnostic in [Rate limiting and client IPs](#rate-limiting-and-client-ips) (`CLIENT_IP_HEADER=cf-connecting-ip`, `TRUSTED_PROXY_COUNT=3`); `PROXY_DIAGNOSTICS=false` and `/health/proxy` returns 404
 - [ ] `REALTIME_BACKEND=redis` if running more than one instance
 - [ ] [Branch protection](#branch-protection-github) on `main` requires the four CI checks
 - [ ] Plan tiers reviewed (free tiers sleep / have quotas)
