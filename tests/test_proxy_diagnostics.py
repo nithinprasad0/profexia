@@ -86,3 +86,34 @@ def test_client_ip_unchanged_without_header_setting(monkeypatch):
 def test_client_ip_header_normalises_ipv6(monkeypatch):
     monkeypatch.setattr(settings, "client_ip_header", "cf-connecting-ip")
     assert rate_limit.client_ip(_req({"CF-Connecting-IP": "2001:DB8::0001"})) == "2001:db8::1"
+
+
+# --- render.yaml must keep the configuration measured in production -----------------
+
+def _render_env() -> dict[str, str]:
+    """Minimal parser for `- key: X` / `value: Y` pairs (avoids a YAML dependency)."""
+    import re
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[1] / "render.yaml").read_text(encoding="utf-8")
+    pairs = re.findall(r"- key:\s*(\S+)\s*\n\s*value:\s*\"?([^\"\n#]+?)\"?\s*(?:#.*)?\n", text)
+    return {k: v.strip() for k, v in pairs}
+
+
+def test_render_yaml_matches_measured_production_config():
+    env = _render_env()
+    assert env["CLIENT_IP_HEADER"] == "cf-connecting-ip"
+    assert env["TRUSTED_PROXY_COUNT"] == "3"
+    assert env["PROXY_DIAGNOSTICS"] == "false"
+
+
+@pytest.mark.parametrize("with_header", [True, False])
+def test_render_config_resolves_measured_chain_to_client(monkeypatch, with_header):
+    """Measured on Render: '<client-sent>, <client>, <cloudflare edge>, <render internal>'."""
+    env = _render_env()
+    monkeypatch.setattr(settings, "client_ip_header", env["CLIENT_IP_HEADER"])
+    monkeypatch.setattr(settings, "trusted_proxy_count", int(env["TRUSTED_PROXY_COUNT"]))
+    headers = {"X-Forwarded-For": f"{FORGED}, {CLIENT}, {EDGE}, 10.20.30.40"}
+    if with_header:
+        headers["CF-Connecting-IP"] = CLIENT
+    assert rate_limit.client_ip(_req(headers)) == CLIENT

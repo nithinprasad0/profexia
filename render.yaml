@@ -42,12 +42,21 @@ services:
         value: "7"
       - key: RUN_MIGRATIONS_ON_STARTUP
         value: "true"
-      # Client IP for per-IP rate limits. Render's edge is Cloudflare, so the
-      # rightmost X-Forwarded-For entry may be a Cloudflare address. MEASURE with
-      # the PROXY_DIAGNOSTICS endpoint and set TRUSTED_PROXY_COUNT and/or
-      # CLIENT_IP_HEADER in the dashboard (docs/DEPLOYMENT.md, "Rate limiting and client IPs").
+      # Client IP for per-IP rate limits, MEASURED in production on 2026-11-04
+      # with the /health/proxy diagnostic (docs/DEPLOYMENT.md, "Rate limiting and
+      # client IPs"). X-Forwarded-For arrives as
+      #   <client-sent entries>, <client>, <Cloudflare edge>, <Render internal (private)>
+      # cf-connecting-ip is set by Cloudflare (client-supplied values are rejected
+      # with 403 at the edge) and is the primary source; the 3rd entry from the
+      # right is the fallback. Re-measure if Render changes its proxy chain.
+      - key: CLIENT_IP_HEADER
+        value: cf-connecting-ip
       - key: TRUSTED_PROXY_COUNT
-        value: "1"
+        value: "3"
+      # Diagnostic endpoint stays disabled in production (404). Enable only
+      # temporarily to re-measure the proxy chain.
+      - key: PROXY_DIAGNOSTICS
+        value: "false"
       # Redis pub/sub fan-out so WebSockets work across multiple instances.
       - key: REALTIME_BACKEND
         value: redis
