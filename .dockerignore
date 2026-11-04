@@ -1,0 +1,22 @@
+# Keep the backend image small and free of local secrets.
+.git/
+.github/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.env.*
+!.env.example
+frontend/
+docs/
+*.zip
+*.md
+render.yaml
+docker-compose*.yml
+.claude/
+tests/
+.gitattributes
+.gitignore
+.dockerignore

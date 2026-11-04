@@ -1,0 +1,78 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: profexia-postgres
+    environment:
+      POSTGRES_DB: profexia
+      POSTGRES_USER: profexia
+      POSTGRES_PASSWORD: profexia
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U profexia -d profexia"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:8-alpine
+    container_name: profexia-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: profexia-api
+    working_dir: /app
+    environment:
+      PYTHONPATH: /app
+      # Local development only. Production values are set on the hosting platform.
+      ENVIRONMENT: development
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+      PORT: "8000"
+      # Locally every request arrives from the Docker gateway IP, so per-IP limits
+      # would act as global limits. Relax them for development only; the per-account
+      # login lockout keeps its production default. Production uses .env.example values.
+      RATE_LIMIT_LOGIN_PER_IP: ${RATE_LIMIT_LOGIN_PER_IP:-1000}
+      RATE_LIMIT_REGISTER_PER_IP: ${RATE_LIMIT_REGISTER_PER_IP:-1000}
+      RATE_LIMIT_REFRESH_PER_IP: ${RATE_LIMIT_REFRESH_PER_IP:-1000}
+      DATABASE_URL: postgresql+asyncpg://profexia:profexia@postgres:5432/profexia
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-profexia-local-dev-only-not-for-production}
+      ACCESS_TOKEN_EXPIRE_MINUTES: "30"
+      REFRESH_TOKEN_EXPIRE_DAYS: "7"
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
+      RAZORPAY_BASE_URL: https://api.razorpay.com/v1
+      JUDGE0_BASE_URL: ${JUDGE0_BASE_URL:-}
+      JUDGE0_API_KEY: ${JUDGE0_API_KEY:-}
+      JUDGE0_AUTH_HEADER: X-RapidAPI-Key
+      JUDGE0_WAIT: "true"
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-}
+      LIVEKIT_URL: ${LIVEKIT_URL:-}
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
