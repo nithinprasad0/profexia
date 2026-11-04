@@ -172,3 +172,17 @@ async def health_ready():
     ok = database_status == "connected" and redis_status == "connected"
     body = {"status": "ok" if ok else "degraded", "database": database_status, "redis": redis_status}
     return JSONResponse(status_code=200 if ok else 503, content=body)
+
+
+@app.get("/health/proxy", include_in_schema=False)
+async def health_proxy(request: Request):
+    """Temporary proxy diagnostic (PROXY_DIAGNOSTICS=true only).
+
+    Describes the forwarding headers of *this* request as structure only (hop
+    counts, address kinds, positions, equality booleans). Never returns IPs.
+    """
+    if not settings.proxy_diagnostics:
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    from app.core.proxy_diagnostics import describe
+
+    return describe(request)

@@ -114,12 +114,13 @@ Redis fixed windows (`app/core/rate_limit.py`). Keys are `profexia:rl:<scope>:<s
 | Judge0 executions per user | 30 / hour | `RATE_LIMIT_CODE_EXECUTIONS_PER_USER`, `RATE_LIMIT_CODE_EXECUTION_WINDOW_SECONDS` |
 
 - Set a limit to `0` (or `RATE_LIMIT_ENABLED=false`) to disable it.
-- The per-account limit is authoritative and IP-independent. Per-IP limits depend on correct client-IP detection: `TRUSTED_PROXY_COUNT=N` uses the N-th `X-Forwarded-For` entry from the right (entries to its left are client-controlled). Use `1` on Render, `0` locally.
+- The per-account limit is authoritative and IP-independent. Per-IP limits depend on correct client-IP detection: `CLIENT_IP_HEADER` (a header the edge proxy overwrites, e.g. `cf-connecting-ip`) or `TRUSTED_PROXY_COUNT=N` (the N-th `X-Forwarded-For` entry from the right; entries to its left are client-controlled). The correct production values must be **measured** with the privacy-safe `GET /health/proxy` diagnostic (`PROXY_DIAGNOSTICS=true`, structure only, no IPs); see docs/DEPLOYMENT.md. Locally both stay unset.
 - **Redis failure:** the limiter fails open (logs a warning) rather than locking everyone out. Login/refresh still need Redis for refresh tokens and return **503** while it is down, so failing open does not create an unauthenticated path.
 - Trade-off: the per-account lock can be triggered by someone who knows a user's email (temporary denial of service for 15 min). The defaults keep that window short.
 
 ## 8. Other controls
 
+- **Content-Security-Policy (frontend, `frontend/vercel.json`):** `default-src 'self'`; scripts and styles only from the app origin (no inline scripts, no `eval`); `connect-src` limited to the app origin and the API over `https://` and `wss://`; `object-src 'none'`, `base-uri 'self'`, `form-action 'self'`, `frame-ancestors 'none'`, `upgrade-insecure-requests`. Reduces the impact of an XSS bug on the tokens in `sessionStorage`. When adding LiveKit video or another external service, add its origin to `connect-src` (and `media-src` if needed).
 - **CORS:** production allows only the exact `https://` origins in `CORS_ORIGINS` (+ optional `CORS_ORIGIN_REGEX`); `*` and `http://` are rejected at startup; credentials are disabled because auth uses bearer headers.
 - **Secrets:** only via environment variables; `.env` is git-ignored; `.env.example` holds placeholders; connection URLs are logged redacted; provider errors are logged by exception type only.
 - **SQL:** SQLAlchemy ORM / bound parameters only; the single raw statement is `SELECT 1`. No string-built SQL.
@@ -137,7 +138,7 @@ WebSocket events are fanned out through Redis pub/sub (`REALTIME_BACKEND=redis`,
 
 | Severity | Risk | Mitigation / decision needed |
 | --- | --- | --- |
-| Medium | Tokens in `sessionStorage` can be stolen by an XSS bug | React escapes output; no `dangerouslySetInnerHTML`. Moving to HttpOnly cookies + CSRF protection is an architectural change (BFF or same-site API domain) |
+| Medium | Tokens in `sessionStorage` can be stolen by an XSS bug | React escapes output; no `dangerouslySetInnerHTML`; strict CSP blocks inline/injected scripts, `eval` and exfiltration to other origins. Moving to HttpOnly cookies + CSRF protection is an architectural change (BFF or same-site API domain) |
 | Medium | Access tokens are not revocable before expiry (logout, role change, deactivation take up to 30 min for open tokens; `/users/me` checks `is_active` on every request) | Shorten `ACCESS_TOKEN_EXPIRE_MINUTES`, or add a Redis deny-list / token version column |
 | Medium | WebSocket tokens travel in the URL query string (may appear in proxy logs outside our control) | Logs we control are redacted. Alternative: first-message auth or short-lived WS tickets (contract change) |
 | Medium | Payment orders accept a client-supplied amount and are not linked to any product/entitlement | Harmless today (payments grant nothing). Before selling courses: add prices server-side and grant access only from verified webhooks |

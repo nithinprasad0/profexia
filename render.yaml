@@ -42,9 +42,10 @@ services:
         value: "7"
       - key: RUN_MIGRATIONS_ON_STARTUP
         value: "true"
-      # Render's proxy appends the real client IP to X-Forwarded-For; trust only
-      # that rightmost entry for rate limiting. Verify after deploying
-      # (docs/DEPLOYMENT.md, "Rate limiting and client IPs").
+      # Client IP for per-IP rate limits. Render's edge is Cloudflare, so the
+      # rightmost X-Forwarded-For entry may be a Cloudflare address. MEASURE with
+      # the PROXY_DIAGNOSTICS endpoint and set TRUSTED_PROXY_COUNT and/or
+      # CLIENT_IP_HEADER in the dashboard (docs/DEPLOYMENT.md, "Rate limiting and client IPs").
       - key: TRUSTED_PROXY_COUNT
         value: "1"
       # Redis pub/sub fan-out so WebSockets work across multiple instances.
