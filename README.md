@@ -2,9 +2,7 @@
 
 **Profexia** is a full-stack learning platform that connects learners with teachers. Teachers publish courses and assessments, run live learning sessions, and learners discover courses, enroll, track their progress, take tests, chat in real time, and run code in the browser.
 
-[![CI](https://github.com/OWNER/profexia/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/profexia/actions/workflows/ci.yml)
-
-> Replace `OWNER` in the badge URL with your GitHub username after publishing.
+[![CI](https://github.com/nithinprasad0/profexia/actions/workflows/ci.yml/badge.svg)](https://github.com/nithinprasad0/profexia/actions/workflows/ci.yml)
 
 ---
 
@@ -117,7 +115,7 @@ profexia/
 Prerequisites: Docker Desktop (or Docker Engine + Compose), Node.js 22+, Git. Python 3.12 is only needed to run the backend outside Docker.
 
 ```bash
-git clone https://github.com/OWNER/profexia.git
+git clone https://github.com/nithinprasad0/profexia.git
 cd profexia
 ```
 

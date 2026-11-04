@@ -19,7 +19,9 @@ Templates: [`/.env.example`](../.env.example) (backend) and [`/frontend/.env.exa
 | `RUN_MIGRATIONS_ON_STARTUP` | no | `true` | Entrypoint runs `alembic upgrade head` + role seed before serving |
 | `PORT` | set by platform | `8000` | Port uvicorn binds on `0.0.0.0` (Render injects it) |
 | `WS_MAX_SIZE_BYTES` | no | `1048576` | Maximum WebSocket frame size accepted by uvicorn |
-| `TRUSTED_PROXY_COUNT` | yes on Render (`1`) | `0` | Proxies appending to `X-Forwarded-For`; the N-th entry from the right is the client IP for rate limiting |
+| `TRUSTED_PROXY_COUNT` | measure on Render | `0` | Proxies appending to `X-Forwarded-For`; the N-th entry from the right is the client IP for rate limiting |
+| `CLIENT_IP_HEADER` | see DEPLOYMENT | empty | Header set by the edge proxy holding the client IP (e.g. `cf-connecting-ip`). Used for rate limiting when valid; precedes `TRUSTED_PROXY_COUNT` |
+| `PROXY_DIAGNOSTICS` | no | `false` | Temporarily enables `GET /health/proxy` (forwarding-header structure only, never IPs) to determine the two settings above |
 | `REALTIME_BACKEND` | no | `redis` | `redis` = pub/sub fan-out across instances; `memory` = single instance only |
 | `REALTIME_CHANNEL` | no | `profexia:realtime` | Redis pub/sub channel shared by all instances of one environment |
 | `UVICORN_EXTRA_ARGS` | no | empty | Extra uvicorn flags, e.g. `--workers 2` (see WebSocket note in DEPLOYMENT.md) |

@@ -11,6 +11,7 @@ path; it only avoids turning a Redis blip into a total lockout.
 """
 
 import hashlib
+import ipaddress
 import logging
 import math
 from dataclasses import dataclass
@@ -40,13 +41,29 @@ def limit_key(scope: str, identifier: str) -> str:
     return f"{KEY_PREFIX}:{scope}:{_hash(identifier)}"
 
 
-def client_ip(request: Request) -> str:
-    """Best-effort client IP.
+def _valid_ip(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        return None
 
-    With TRUSTED_PROXY_COUNT=N, the N-th entry from the *right* of
-    X-Forwarded-For is used: entries to its left can be forged by the client,
-    entries appended by our own proxies cannot.
+
+def client_ip(request: Request) -> str:
+    """Best-effort client IP, in order of preference:
+
+    1. CLIENT_IP_HEADER (e.g. cf-connecting-ip), when configured and valid. Only
+       safe when the edge proxy always overwrites that header.
+    2. With TRUSTED_PROXY_COUNT=N, the N-th entry from the *right* of
+       X-Forwarded-For: entries to its left can be forged by the client,
+       entries appended by our own proxies cannot.
+    3. The TCP peer address.
     """
+    if settings.client_ip_header:
+        from_header = _valid_ip(request.headers.get(settings.client_ip_header))
+        if from_header:
+            return from_header
     hops = settings.trusted_proxy_count
     if hops > 0:
         forwarded = request.headers.get("x-forwarded-for", "")

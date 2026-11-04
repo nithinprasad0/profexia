@@ -112,6 +112,14 @@ class Settings(BaseSettings):
     # Number of reverse proxies in front of the API that append to X-Forwarded-For.
     # 0 = use the socket peer address. On Render, set 1 (see docs/DEPLOYMENT.md).
     trusted_proxy_count: int = 0
+    # Optional: read the client IP from a header set by the edge proxy itself
+    # (e.g. "cf-connecting-ip" behind Cloudflare). Takes precedence over
+    # TRUSTED_PROXY_COUNT when the header holds a valid IP. Only set this when the
+    # edge is guaranteed to overwrite the header (see docs/DEPLOYMENT.md).
+    client_ip_header: str = ""
+    # Temporary: expose GET /health/proxy, a privacy-safe description of the
+    # forwarding headers (structure only, never IP addresses). Keep off normally.
+    proxy_diagnostics: bool = False
 
     # --- Real-time fan-out ---
     # "redis": publish WebSocket events through Redis pub/sub so clients connected to

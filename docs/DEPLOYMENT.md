@@ -24,7 +24,7 @@ Security model and hardening details: [SECURITY.md](../SECURITY.md).
 | 🔑 Needs your GitHub account | Create the repository, push, enable branch protection | You |
 | 🔑 Needs your Neon account | Create project/database, copy the connection string | You |
 | 🔑 Needs your Upstash account | Create Redis database, copy the `rediss://` URL | You |
-| 🔑 Needs your Render account | Create the Blueprint, paste the three secrets, deploy, run the `TRUSTED_PROXY_COUNT` probe | You |
+| 🔑 Needs your Render account | Create the Blueprint, paste the three secrets, deploy, run the [client-IP diagnostic](#rate-limiting-and-client-ips) | You |
 | 🔑 Needs your Vercel account | Import the repo (root `frontend`), set `VITE_API_URL`, deploy | You |
 | ✋ Needs your credentials / approval | Commit and push (not done), Razorpay/Judge0/LiveKit keys, promoting the first admin, any paid plan upgrades | You |
 | ⏳ Not yet verifiable | Anything on the real hosted services (Render build, Neon, Upstash, Vercel routing). Run the [production verification checklist](#production-verification-checklist) after deploying | You (Claude can help with the results) |
@@ -91,6 +91,23 @@ The **CI** workflow (`.github/workflows/ci.yml`) runs on every push and pull req
 CI never deploys. Render is configured with `autoDeployTrigger: checksPass`, so it only deploys commits whose checks passed. On Vercel, enable the same behaviour by requiring the CI checks in a GitHub branch protection rule for `main` (Settings → Branches) and merging through pull requests.
 
 ---
+
+### Branch protection (GitHub)
+
+Prevents untested code reaching `main` (Vercel deploys every push to `main`; Render waits for CI).
+
+1. GitHub → **nithinprasad0/profexia → Settings → Branches** → **Add branch ruleset** (or **Add classic branch protection rule**).
+2. Ruleset name `main`, **Enforcement status: Active**, **Target branches → Add target → Include default branch**.
+3. Enable:
+   - **Restrict deletions** and **Block force pushes**
+   - **Require a pull request before merging** (required approvals: `0` if you work alone; GitHub does not let you approve your own PR)
+   - **Require status checks to pass** → **Require branches to be up to date before merging** → **Add checks**, then add all four (they appear after CI has run at least once; names must match exactly):
+     - `Backend (tests, migrations, smoke)`
+     - `Frontend (typecheck, build)`
+     - `Security (secrets, dependencies)`
+     - `Docker image builds`
+4. Leave **Bypass list** empty (or add yourself only for emergencies). **Create**.
+5. From now on: work on a branch → push → open a PR → CI runs and Vercel posts a preview URL → merge when green. Render deploys `main` only after the checks pass.
 
 ## 2. Neon PostgreSQL
 
@@ -285,18 +302,40 @@ Then in the browser: register → land on `/app` → refresh the page (still sig
 
 ### Rate limiting and client IPs
 
-Login, registration, refresh and code execution are rate limited (thresholds in [ENVIRONMENT.md](ENVIRONMENT.md#rate-limiting)). The per-account login lock does not depend on IPs. For the per-IP limits, set `TRUSTED_PROXY_COUNT` to the number of proxies that append to `X-Forwarded-For` in front of the API. `render.yaml` sets **1**: Render's proxy appends the connecting client's IP, and anything to its left is client-controlled. Verify once after deploying:
+Login, registration, refresh and code execution are rate limited (thresholds in [ENVIRONMENT.md](ENVIRONMENT.md#rate-limiting)). The per-account login lock does not depend on IPs. The **per-IP** limits need the real client IP, which depends on the proxies in front of the API:
 
-```bash
-# More than RATE_LIMIT_LOGIN_PER_IP requests, each with a *different* forged header.
-for i in $(seq 1 35); do
-  curl -s -o /dev/null -w "%{http_code} " -X POST https://<api>/api/v1/auth/login \
-    -H "Content-Type: application/json" -H "X-Forwarded-For: 10.0.0.$i" \
-    -d "{\"email\":\"probe$i@example.com\",\"password\":\"x\"}"
-done
-```
+| Setting | Meaning |
+| --- | --- |
+| `CLIENT_IP_HEADER` | Read the IP from a header the edge sets itself (e.g. `cf-connecting-ip`). Safe only if the edge **always overwrites** it |
+| `TRUSTED_PROXY_COUNT=N` | Use the N-th `X-Forwarded-For` entry from the right (entries further left are client-controlled) |
+| neither | Use the TCP peer address (local/docker) |
 
-The `401`s should turn into `429` after 30 requests. If they never do, the forged header is being trusted: adjust `TRUSTED_PROXY_COUNT`. The probe uses non-existent emails, so no real account is locked, but your own IP cannot log in until the window expires.
+Render serves `onrender.com` through Cloudflare, and reports suggest `X-Forwarded-For` arrives as `<client-sent>, <client>, <cloudflare-edge>`. If so, `TRUSTED_PROXY_COUNT=1` resolves to a **Cloudflare edge address shared by many users**. Do not guess: measure it with the diagnostic below.
+
+**Measure (privacy-safe):**
+
+1. Render → Environment → add `PROXY_DIAGNOSTICS=true` (Render redeploys).
+2. Call the diagnostic normally and with forged headers (documentation addresses, RFC 5737). The response describes structure only: hop counts, address *kinds*, positions and true/false comparisons. It never contains an IP address.
+
+   ```bash
+   API=https://profexia-api.onrender.com
+   curl -s $API/health/proxy | python -m json.tool
+   curl -s $API/health/proxy -H "X-Forwarded-For: 203.0.113.7" \
+     -H "CF-Connecting-IP: 203.0.113.8" -H "True-Client-IP: 203.0.113.9" | python -m json.tool
+   ```
+
+3. Read the result:
+
+   | Observation | Conclusion |
+   | --- | --- |
+   | `ip_headers.cf-connecting-ip.kind` is `public` in **both** calls (never `test-net`) | Cloudflare overwrites it; `CLIENT_IP_HEADER=cf-connecting-ip` is safe and preferred |
+   | `trusted_proxy_count_candidates.N.equals_cf_connecting_ip` is `true` for exactly one N, in both calls | `TRUSTED_PROXY_COUNT=N` would also work (fallback) |
+   | `current_config.resolved_equals_cf_connecting_ip` is `false` | The current setting does **not** resolve to the client: change it |
+   | a forged header shows `kind: test-net` | That header is client-controlled: never trust it |
+
+4. Apply the conclusion in Render → Environment (e.g. `CLIENT_IP_HEADER=cf-connecting-ip`, `TRUSTED_PROXY_COUNT=<N>`), set `PROXY_DIAGNOSTICS=false`, and re-run step 2: the endpoint must return 404 and, before you disable it, `resolved_equals_cf_connecting_ip` must be `true`.
+
+The old "forge X-Forwarded-For 35 times" probe is **not** sufficient: if the rightmost entry is a Cloudflare edge address, the key stays constant and the probe looks correct while all users behind that edge share one bucket.
 
 ### WebSocket deployment
 
@@ -334,7 +373,7 @@ The `401`s should turn into `429` after 30 requests. If they never do, the forge
 | Service exits with `Refusing to start: invalid production configuration` | The log lists the problems: weak `JWT_SECRET_KEY`, missing or `http://` `CORS_ORIGINS`, local DB/Redis URLs |
 | Browser shows a CORS error / preflight fails | `CORS_ORIGINS` must exactly match the page origin (scheme + host, no trailing slash); redeploy after editing |
 | Login/refresh return 503 | Redis unreachable: `REDIS_URL` must use `rediss://` for Upstash; `/health` shows `redis: disconnected` |
-| Users get 429 unexpectedly | Many users behind one IP (office/NAT) hitting per-IP limits, or a wrong `TRUSTED_PROXY_COUNT` making all users share the proxy IP; raise the limits or fix the count |
+| Users get 429 unexpectedly | Many users behind one IP (office/NAT), or a wrong client-IP setting making users share an edge/proxy address; run the [client-IP diagnostic](#rate-limiting-and-client-ips) |
 | `prepared statement ... does not exist` | Neon `-pooler` host: the app disables the statement cache for hosts containing `-pooler`; otherwise use the direct host |
 | Chat returns 400 | Room ids must be `course:<id>`, `session:<id>` or `dm:<low>:<high>` |
 | WebSocket closes immediately with code 1008 | Missing/expired token, or the user is not a member of that room/session |
@@ -390,9 +429,9 @@ Not yet verified against live Razorpay — see *Remaining issues* in the project
 - [ ] Admin account promoted with `create_admin`
 - [ ] (If used) Razorpay webhook URL + secret configured; test payment in test mode
 - [ ] (If used) Judge0 and LiveKit credentials set and exercised once
-- [ ] `TRUSTED_PROXY_COUNT` verified with the probe in [Rate limiting and client IPs](#rate-limiting-and-client-ips)
+- [ ] Client IP verified with the diagnostic in [Rate limiting and client IPs](#rate-limiting-and-client-ips); `PROXY_DIAGNOSTICS` back to `false`
 - [ ] `REALTIME_BACKEND=redis` if running more than one instance
-- [ ] Branch protection on `main` requires CI
+- [ ] [Branch protection](#branch-protection-github) on `main` requires the four CI checks
 - [ ] Plan tiers reviewed (free tiers sleep / have quotas)
 
 ---
