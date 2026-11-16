@@ -177,15 +177,17 @@ written until the phrase is confirmed and the run has not been cancelled.
     Skills in a conflicting category count as conflicts too.
 - **Conflicts abort** the whole run before anything is written. `--skip-conflicts` seeds
   everything else and leaves the conflicting items out.
-  - The admin catalogue API that will rename, merge and deactivate skills doesn't exist yet;
-    it is planned for B1-A PR 3.
-  - Until then, resolve conflicts with a reviewed SQL transaction, or leave the item out.
+  - The catalogue administration API (to rename, merge and deactivate skills) does not exist
+    yet; it is planned as a separate follow-up.
+  - Until it is implemented, resolve conflicts through a separately reviewed SQL transaction,
+    or leave the conflicting item out.
 - **Insert-only.** Existing categories and skills, course–skill links and member
   offers/wants are never updated, deactivated or deleted.
 - **One transaction, locked.** In apply mode, before planning, the script:
   - takes `pg_try_advisory_xact_lock`, so only one seed runs at a time;
   - takes `SHARE ROW EXCLUSIVE` locks on `skill_categories` and `skills`, so no other writer
-    (such as the admin API) can insert between planning and inserting;
+    (such as the existing admin `POST /skills` endpoint) can insert between planning and
+    inserting;
   - uses `lock_timeout` 5 s and `statement_timeout` 60 s.
 
   Course tagging is not blocked: foreign-key checks need only a weaker lock. If a writer
@@ -218,7 +220,7 @@ Aliases are used for duplicate detection only and are not stored:
   - the Indian languages most relevant to the initial audience (Hindi, Malayalam, Tamil),
     alongside widely learnt foreign languages.
 - It is deliberately small. Members will be able to propose more through skill suggestions,
-  which arrive with the catalogue API.
+  which are planned as part of the separate catalogue administration follow-up.
 - Categories get a one-line description. Skills have no description, so as not to invent copy.
 - Slugs are permanent identifiers. That is why Go is `go-programming-language` rather than
   the ambiguous `go`.
@@ -229,8 +231,10 @@ Aliases are used for duplicate detection only and are not stored:
   seed inserts only the new items.
 - Removing an item from the file does **not** remove it from the database. To retire a
   seeded skill:
-  - after B1-A PR 3: deactivate it through the admin catalogue API;
-  - until then: run a reviewed SQL transaction that sets `is_active = false, updated_at = now()`.
+  - once the catalogue administration API exists (planned as a separate follow-up):
+    deactivate it through that API;
+  - until then: run a separately reviewed SQL transaction that sets
+    `is_active = false, updated_at = now()`.
 
 ## Rolling back a seed
 
