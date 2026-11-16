@@ -20,6 +20,14 @@ fails fast instead of queueing behind a long-running transaction. The ALTERs on
 `skills` (0 rows in production) and `profiles` (2 rows) take brief ACCESS
 EXCLUSIVE locks; all defaults are constant or `now()`, so no table rewrite.
 
+Timestamps: `created_at`/`updated_at` have a server default of now() (transaction
+start time), which fills them on INSERT from any client and for pre-existing rows
+(set to the migration time). `updated_at` is refreshed on UPDATE by SQLAlchemy's
+`onupdate=func.now()`, which applies to ORM flushes and to Core update()
+statements issued through SQLAlchemy. Raw SQL (psql, manual fixes) does not bump
+it. All application writes go through SQLAlchemy, so no database trigger is added;
+operators running manual UPDATEs should set `updated_at = now()` explicitly.
+
 DOWNGRADE DESTROYS ALL B1-A DATA (categories, offers, wants, suggestions,
 skill slugs/categories/active flags and the new profile fields). Use it only
 before real use; afterwards roll forward or restore from a Neon backup branch.
@@ -60,25 +68,57 @@ def _timestamps():
     ]
 
 
+_SLUG_RE = re.compile(SLUG_PATTERN)
+
+
 def _slugify(name: str) -> str:
     """Deterministic slug for backfilling pre-existing skills (frozen copy; migrations
-    must not import application code that may change later)."""
+    must not import application code that may change later). May return "" for names
+    with no ASCII-representable characters; callers fall back to `skill-<id>`."""
     text = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii").lower()
     text = text.replace("+", " plus ").replace("#", " sharp ")
     text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
     return text[:SKILL_SLUG_MAX].strip("-")
 
 
+def _with_suffix(base: str, suffix: str) -> str:
+    """Truncate `base` so that base + suffix fits SKILL_SLUG_MAX, without a dangling '-'."""
+    return base[: SKILL_SLUG_MAX - len(suffix)].rstrip("-") + suffix
+
+
+def _plan_skill_slugs(rows, taken) -> dict[int, str]:
+    """Pure, deterministic slug assignment for `rows` = [(id, name), ...].
+
+    Rows are processed in ascending id order. A slug already in `taken` (existing
+    slugs, or ones assigned to lower ids in this run) is never reused: the skill id
+    is appended, then `-2`, `-3`, ... until the candidate is free. Every result is
+    <= SKILL_SLUG_MAX characters and matches SLUG_PATTERN.
+    """
+    taken = set(taken)
+    plan: dict[int, str] = {}
+    for skill_id, name in sorted(rows):
+        base = _slugify(name) or f"skill-{skill_id}"
+        candidate, attempt = base, 1
+        while candidate in taken:
+            suffix = f"-{skill_id}" if attempt == 1 else f"-{skill_id}-{attempt}"
+            candidate = _with_suffix(base, suffix)
+            attempt += 1
+        if len(candidate) > SKILL_SLUG_MAX or not _SLUG_RE.fullmatch(candidate):
+            raise RuntimeError(f"0006: generated an invalid slug for skill id {skill_id}")
+        taken.add(candidate)
+        plan[skill_id] = candidate
+    return plan
+
+
 def _backfill_skill_slugs(bind) -> None:
     rows = bind.execute(sa.text("SELECT id, name FROM skills WHERE slug IS NULL ORDER BY id")).all()
     taken = {r[0] for r in bind.execute(sa.text("SELECT slug FROM skills WHERE slug IS NOT NULL"))}
-    for skill_id, name in rows:
-        slug = _slugify(name) or f"skill-{skill_id}"
-        if slug in taken:  # collision: suffix with the (stable) skill id
-            suffix = f"-{skill_id}"
-            slug = slug[: SKILL_SLUG_MAX - len(suffix)].strip("-") + suffix
-        taken.add(slug)
-        bind.execute(sa.text("UPDATE skills SET slug = :slug WHERE id = :id"), {"slug": slug, "id": skill_id})
+    for skill_id, slug in _plan_skill_slugs(rows, taken).items():
+        # `slug IS NULL` guard: never overwrite a slug that already exists.
+        result = bind.execute(sa.text("UPDATE skills SET slug = :slug WHERE id = :id AND slug IS NULL"),
+                              {"slug": slug, "id": skill_id})
+        if result.rowcount != 1:
+            raise RuntimeError(f"0006: slug backfill did not update skill id {skill_id} exactly once")
 
 
 def upgrade():

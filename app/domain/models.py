@@ -24,6 +24,13 @@ def _in(column: str, values) -> str:
     return f"{column} IN ({', '.join(repr(v) for v in values)})"
 
 
+# B1-A timestamps: `server_default=func.now()` fills created_at/updated_at on INSERT
+# from any client; `onupdate=func.now()` refreshes updated_at on ORM flushes and Core
+# update() statements issued through SQLAlchemy. Raw SQL outside SQLAlchemy does not
+# bump updated_at (no DB trigger by design; see migration 0006). Write through
+# SQLAlchemy, or set `updated_at = now()` explicitly in manual SQL.
+
+
 def _rank(column: str) -> str:
     whens = " ".join(f"WHEN '{k}' THEN {v}" for k, v in LEVEL_RANK.items())
     return f"(CASE {column} {whens} END)"

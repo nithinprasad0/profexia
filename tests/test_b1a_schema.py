@@ -50,6 +50,101 @@ async def _connect(url: str):
     return await asyncpg.connect(_asyncpg_dsn(url))
 
 
+# --------------------------------------------------------------------------- slug planning (pure)
+
+
+def _migration_module():
+    import importlib.util
+
+    path = ROOT / "alembic" / "versions" / "0006_member_profiles_skills.py"
+    spec = importlib.util.spec_from_file_location("migration_0006", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+M0006 = _migration_module()
+SLUG_RE = __import__("re").compile(M0006.SLUG_PATTERN)
+
+
+def _assert_valid_plan(plan: dict, taken: set = frozenset()):
+    slugs = list(plan.values())
+    assert len(slugs) == len(set(slugs)), "duplicate slug generated"
+    assert not set(slugs) & set(taken), "existing slug reused"
+    for slug in slugs:
+        assert 1 <= len(slug) <= 120, slug
+        assert SLUG_RE.fullmatch(slug), slug
+
+
+def test_slug_model_constants_match_migration():
+    from app.domain import models
+
+    assert (models.SLUG_PATTERN, models.SKILL_SLUG_MAX) == (M0006.SLUG_PATTERN, M0006.SKILL_SLUG_MAX)
+    assert models.LEVEL_RANK == M0006._LEVEL_RANK
+
+
+@pytest.mark.parametrize("name", ["a" * 300, "C++ " * 80, "x-" * 200, "Ä" * 150 + "b", "# " * 100 + "z",
+                                  "word " * 30 + "!" * 50])
+def test_slug_long_names_truncated_and_valid(name):
+    plan = M0006._plan_skill_slugs([(1, name)], set())
+    _assert_valid_plan(plan)
+    assert not plan[1].endswith("-")
+
+
+def test_slug_names_equal_after_truncation_get_unique_slugs():
+    rows = [(10, "x" * 130 + "A"), (11, "x" * 130 + "B"), (12, "x" * 125)]
+    plan = M0006._plan_skill_slugs(rows, set())
+    _assert_valid_plan(plan)
+    assert plan[10] == "x" * 120
+    assert plan[11] == "x" * (120 - 3) + "-11"
+    assert plan[12] == "x" * (120 - 3) + "-12"
+
+
+def test_slug_collision_with_preexisting_slug_is_never_reused():
+    taken = {"python", "python-1", "rust"}
+    plan = M0006._plan_skill_slugs([(1, "Python"), (2, "Rust"), (3, "Go")], taken)
+    _assert_valid_plan(plan, taken)
+    assert plan == {1: "python-1-2", 2: "rust-2", 3: "go"}
+
+
+def test_slug_suffix_colliding_with_a_natural_slug():
+    # "node-js-3" is both the suffixed form of id 3 and the natural slug of id 7.
+    plan = M0006._plan_skill_slugs([(7, "node-js-3"), (3, "Node JS"), (2, "Node.js")], set())
+    _assert_valid_plan(plan)
+    assert plan == {2: "node-js", 3: "node-js-3", 7: "node-js-3-7"}
+
+
+def test_slug_fallback_for_non_ascii_names():
+    plan = M0006._plan_skill_slugs([(5, "日本語"), (6, "Skill 5"), (8, "中文")], set())
+    _assert_valid_plan(plan)
+    assert plan == {5: "skill-5", 6: "skill-5-6", 8: "skill-8"}
+
+
+@pytest.mark.parametrize("skill_id", [2_147_483_647, 999_999_999, 10**18])
+def test_slug_suffix_with_large_ids(skill_id):
+    long = "z" * 200
+    taken = {"z" * 120, M0006._with_suffix("z" * 120, f"-{skill_id}")}
+    plan = M0006._plan_skill_slugs([(skill_id, long)], taken)
+    _assert_valid_plan(plan, taken)
+    assert plan[skill_id].endswith(f"-{skill_id}-2")
+
+
+def test_slug_planning_is_deterministic_and_order_independent():
+    import random
+
+    rnd = random.Random(20261116)
+    alphabet = "abcXYZ019 +#.-_/é日"
+    rows = [(i, "".join(rnd.choice(alphabet) for _ in range(rnd.randint(1, 100)))) for i in range(1, 400)]
+    rows += [(1000 + i, "Same Name") for i in range(20)]  # heavy collisions
+    taken = {"same-name", "same-name-1000", "skill-1"}
+    first = M0006._plan_skill_slugs(rows, taken)
+    shuffled = rows[:]
+    rnd.shuffle(shuffled)
+    assert M0006._plan_skill_slugs(shuffled, taken) == first
+    assert M0006._plan_skill_slugs(rows, set(taken)) == first
+    _assert_valid_plan(first, taken)
+
+
 # --------------------------------------------------------------------------- constraints
 
 
@@ -306,6 +401,78 @@ def test_length_limits(integration, table, column, length):
     asyncio.run(_in_rolled_back_tx(body))
 
 
+# --------------------------------------------------------------------------- timestamps
+
+
+def test_updated_at_semantics(integration):
+    """server_default fills timestamps on INSERT; SQLAlchemy onupdate bumps updated_at for
+    ORM flushes and Core update(); raw SQL does not (documented, no trigger by design)."""
+    from sqlalchemy import select, text, update
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.domain.models import MemberSkillOffer, Profile, Role, Skill, SkillCategory, User
+
+    async def run():
+        engine = create_async_engine(settings.database_url)
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        tag = uuid.uuid4().hex[:10]
+        try:
+            async with Session() as s:  # transaction 1: INSERTs
+                role = await s.scalar(select(Role).where(Role.name == "learner"))
+                user = User(email=f"ts{tag}@example.com", username=f"ts{tag}", password_hash="x", role_id=role.id)
+                user.profile = Profile(display_name="ts")
+                category = SkillCategory(slug=f"ts-{tag}", name=f"TS {tag}")
+                skill = Skill(name=f"TS {tag}", slug=f"ts-{tag}", category=category)
+                s.add_all([user, category, skill])
+                await s.flush()
+                offer = MemberSkillOffer(user_id=user.id, skill_id=skill.id, level="beginner")
+                s.add(offer)
+                await s.commit()
+                objs = [user.profile, category, skill, offer]
+                for o in objs:
+                    await s.refresh(o)
+                    assert o.created_at is not None and o.updated_at == o.created_at
+                inserted = {type(o): o.updated_at for o in objs}
+
+            async with Session() as s:  # transaction 2: ORM attribute updates
+                profile = await s.get(Profile, objs[0].id)
+                profile.headline = "changed"
+                (await s.get(SkillCategory, category.id)).sort_order = 5
+                (await s.get(Skill, skill.id)).is_active = False
+                (await s.get(MemberSkillOffer, offer.id)).level = "expert"
+                await s.commit()
+
+            async with Session() as s:
+                orm_updated = {m: (await s.get(m, o.id, populate_existing=True)).updated_at
+                               for m, o in zip((Profile, SkillCategory, Skill, MemberSkillOffer), objs)}
+            assert all(orm_updated[m] > inserted[m] for m in orm_updated), (inserted, orm_updated)
+
+            async with Session() as s:  # transaction 3: Core update() through SQLAlchemy
+                await s.execute(update(MemberSkillOffer).where(MemberSkillOffer.id == offer.id)
+                                .values(description="core"))
+                await s.commit()
+            async with Session() as s:
+                core_updated = (await s.get(MemberSkillOffer, offer.id, populate_existing=True)).updated_at
+            assert core_updated > orm_updated[MemberSkillOffer]
+
+            async with Session() as s:  # transaction 4: raw SQL does NOT bump updated_at
+                await s.execute(text("UPDATE member_skill_offers SET description = 'raw' WHERE id = :id"),
+                                {"id": offer.id})
+                await s.commit()
+            async with Session() as s:
+                raw = await s.get(MemberSkillOffer, offer.id, populate_existing=True)
+            assert raw.description == "raw" and raw.updated_at == core_updated
+        finally:
+            async with Session() as s:  # remove only this test's rows (test database)
+                await s.execute(text("DELETE FROM users WHERE username = :u"), {"u": f"ts{tag}"})
+                await s.execute(text("DELETE FROM skills WHERE slug = :s"), {"s": f"ts-{tag}"})
+                await s.execute(text("DELETE FROM skill_categories WHERE slug = :s"), {"s": f"ts-{tag}"})
+                await s.commit()
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
 # --------------------------------------------------------------------------- scoped parity
 
 
@@ -488,6 +655,11 @@ async def _seed_production_like(url: str) -> dict[str, int]:
         ids = {}
         for name in ("C++", "Node.js", "Node JS", "C#", "日本語", "  Data   Science "):
             ids[name] = await conn.fetchval("INSERT INTO skills (name) VALUES ($1) RETURNING id", name)
+        # Hard cases: a natural slug equal to another row's suffixed slug, a natural slug
+        # equal to the non-ASCII fallback, and two max-length names that only differ
+        # after the 120-character slug truncation.
+        for name in (f"Node JS {ids['Node JS']}", f"Skill {ids['日本語']}", "C" + "+" * 99, "C" + "+" * 98 + "#"):
+            ids[name] = await conn.fetchval("INSERT INTO skills (name) VALUES ($1) RETURNING id", name)
         return ids
     finally:
         await conn.close()
@@ -536,6 +708,18 @@ def test_migration_0006_upgrade_downgrade_reupgrade(throwaway_db):
     assert slugs["C#"] == "c-sharp"
     assert slugs["日本語"] == f"skill-{skill_ids['日本語']}"
     assert slugs["  Data   Science "] == "data-science"
+    nj = f"Node JS {skill_ids['Node JS']}"
+    assert slugs[nj] == f"node-js-{skill_ids['Node JS']}-{skill_ids[nj]}"
+    sk = f"Skill {skill_ids['日本語']}"
+    assert slugs[sk] == f"skill-{skill_ids['日本語']}-{skill_ids[sk]}"
+    long_a, long_b = "C" + "+" * 99, "C" + "+" * 98 + "#"
+    assert len(slugs[long_a]) == 120 and slugs[long_a].startswith("c-plus-plus")
+    assert slugs[long_b].endswith(f"-{skill_ids[long_b]}") and len(slugs[long_b]) <= 120
+    # Same result as the pure planner, all unique, all valid (the unique index and
+    # CHECK constraint were created successfully on top of them).
+    assert slugs == {name: M0006._plan_skill_slugs([(i, name) for name, i in skill_ids.items()], set())[i]
+                     for name, i in skill_ids.items()}
+    _assert_valid_plan(dict(enumerate(slugs.values())))
 
     # Downgrade restores the exact 0005 schema and keeps pre-existing data.
     r = _alembic(url, "downgrade", "-1")
@@ -543,13 +727,16 @@ def test_migration_0006_upgrade_downgrade_reupgrade(throwaway_db):
     assert asyncio.run(_snapshot(url)) == before
     counts = asyncio.run(_fetch(url, "SELECT (SELECT count(*) FROM users), (SELECT count(*) FROM profiles), "
                                      "(SELECT count(*) FROM skills)"))
-    assert tuple(counts[0]) == (2, 2, 6)
+    assert tuple(counts[0]) == (2, 2, len(skill_ids))
 
     # Re-upgrade (twice: idempotent) gives the same 0006 schema again.
     for _ in range(2):
         r = _alembic(url, "upgrade", "head")
         assert r.returncode == 0, r.stderr
     assert asyncio.run(_snapshot(url)) == after
+    # Deterministic: the re-run backfill produced exactly the same slugs.
+    again = {r["name"]: r["slug"] for r in asyncio.run(_fetch(url, "SELECT name, slug FROM skills"))}
+    assert again == slugs
 
 
 def test_migration_0006_aborts_on_case_duplicate_skill_names(throwaway_db):
