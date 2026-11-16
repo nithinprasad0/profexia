@@ -17,6 +17,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.core.config import normalize_database_url, settings
@@ -36,8 +37,11 @@ def test_shipped_catalogue_is_valid_and_canonical():
     assert all(s.slug == sc.slugify(s.name) for s in CATALOG.skills)
     assert {s.category for s in CATALOG.skills} == {c.slug for c in CATALOG.categories}
     assert len({c.sort_order for c in CATALOG.categories}) == N_CATEGORIES
-    for s in ("c-plus-plus", "c-sharp", "node-js", "html-css", "ui-ux-design"):
+    for s in ("c-plus-plus", "c-sharp", "node-js", "html-css", "ui-ux-design", "go-programming-language"):
         assert s in {k.slug for k in CATALOG.skills}
+    assert "go" not in {k.slug for k in CATALOG.skills}  # L5: no ambiguous permanent slug
+    go = next(k for k in CATALOG.skills if k.slug == "go-programming-language")
+    assert go.name == "Go (Programming Language)" and set(go.aliases) == {"Go", "Golang"}
 
 
 def _mutated(fn):
@@ -64,6 +68,15 @@ BAD_CATALOGUES = {
     "empty skills": lambda r: r.update(skills=[]),
     "boolean sort order": lambda r: r["categories"][0].update(sort_order=True),
     "not an object": lambda r: r["skills"].__setitem__(0, "python"),
+    # L1: entries whose compact keys overlap would make a second run ambiguous.
+    "category compact-key overlap (design-media / Media)": lambda r: r["categories"].append(
+        {"slug": "design-media", "name": "Media", "sort_order": 90}),
+    "skill compact-key overlap (NodeJS vs Node.js)": lambda r: r["skills"].append(
+        {"slug": "nodejs", "name": "NodeJS", "category": "web-development"}),
+    "alias overlaps another skill": lambda r: r["skills"][0].update(aliases=["Java"]),
+    "alias without letters or digits": lambda r: r["skills"][0].update(aliases=["--"]),
+    "aliases not a list": lambda r: r["skills"][0].update(aliases="Py"),
+    "non-ascii alias": lambda r: r["skills"][0].update(aliases=["Pyth\u00f6n"]),
 }
 
 
@@ -80,17 +93,113 @@ def test_unreadable_catalogue_file(tmp_path):
         sc.load_catalog(bad)
 
 
-@pytest.mark.parametrize("url,env,protected", [
-    ("postgresql+asyncpg://u:p@127.0.0.1:5432/x", "development", False),
-    ("postgresql+asyncpg://u:p@localhost/x", "test", False),
-    ("postgresql+asyncpg://u:p@postgres:5432/x", "development", False),
-    ("postgresql+asyncpg://u:p@db.localhost/x", "development", False),
-    ("postgresql+asyncpg://u:p@127.0.0.1:5432/x", "production", True),
-    ("postgresql+asyncpg://u:p@ep-x-pooler.eu-central-1.aws.neon.tech/neondb", "development", True),
-    ("postgresql+asyncpg://u:p@10.0.0.5/x", "development", True),
+def test_design_media_media_split_is_rejected_instead_of_self_conflicting():
+    """L1 regression: this pair used to validate and then conflict with itself on run 2."""
+    raw = _mutated(BAD_CATALOGUES["category compact-key overlap (design-media / Media)"])
+    with pytest.raises(sc.CatalogDataError, match="overlaps"):
+        sc.validate_catalog(raw)
+
+
+# --------------------------------------------------------------------------- target identification (H1, M1)
+
+NEON = "ep-late-example-123456"
+TARGETS = {
+    # url -> (effective hosts, verified-local URL?, endpoint)
+    "postgresql+asyncpg://u:p@127.0.0.1:5432/x": (("127.0.0.1",), True, "127.0.0.1"),
+    "postgresql+asyncpg://u:p@localhost/x": (("localhost",), True, "localhost"),
+    "postgresql+asyncpg://u:p@postgres:5432/x": (("postgres",), True, "postgres"),
+    "postgresql+asyncpg://u:p@db.localhost/x": (("db.localhost",), True, "db.localhost"),
+    "postgresql+asyncpg://u:p@[::1]:5432/x": (("::1",), True, "::1"),
+    # H1 regression: the netloc says localhost but asyncpg dials the ?host= value.
+    f"postgresql+asyncpg://u:p@localhost/neondb?host={NEON}-pooler.c-2.eu-central-1.aws.neon.tech":
+        ((f"{NEON}-pooler.c-2.eu-central-1.aws.neon.tech",), False, NEON),
+    normalize_database_url(f"postgresql://u:p@{NEON}.c-2.eu-central-1.aws.neon.tech/neondb?sslmode=require"):
+        ((f"{NEON}.c-2.eu-central-1.aws.neon.tech",), False, NEON),
+    "postgresql+asyncpg://u:p@127.0.0.1/x?ssl=require": (("127.0.0.1",), False, "127.0.0.1"),
+    "postgresql+asyncpg://u:p@/x?host=localhost:5432&host=127.0.0.1:5433": (("localhost", "127.0.0.1"), False, None),
+    "postgresql+asyncpg://u:p@/x?host=/var/run/postgresql": (("/var/run/postgresql",), False, None),
+    "postgresql+asyncpg://u:p@/x": ((), False, None),
+    "postgresql+asyncpg://u:p@10.0.0.5/x": (("10.0.0.5",), False, "10.0.0.5"),
+    "mysql://u:p@localhost/x": ((), False, None),
+}
+
+
+@pytest.mark.parametrize("url", list(TARGETS), ids=[str(i) for i in range(len(TARGETS))])
+def test_describe_target_uses_effective_driver_host(url):
+    hosts, local, endpoint = TARGETS[url]
+    t = sc.describe_target(url)
+    assert (t.hosts, not t.problems, t.endpoint) == (hosts, local, endpoint)
+
+
+def test_describe_target_never_raises_or_echoes_url():
+    t = sc.describe_target("postgresql+asyncpg://u:s3cret@[bad")
+    assert t.problems and "s3cret" not in repr(t)
+
+
+LOCAL_FACTS = sc.ServerFacts("profexia", ssl=False, neon=False)
+
+
+def test_classify_requires_every_signal_to_be_local():
+    local = sc.describe_target("postgresql+asyncpg://u:p@127.0.0.1/profexia")
+    assert sc.classify(local, LOCAL_FACTS, "development") == []
+    assert "ENVIRONMENT=production" in sc.classify(local, LOCAL_FACTS, "production")
+    # Localhost tunnel to a managed server: the URL looks local, the server does not.
+    assert sc.classify(local, sc.ServerFacts("neondb", ssl=True, neon=False), "development")
+    assert sc.classify(local, sc.ServerFacts("neondb", ssl=False, neon=True), "development")
+
+
+def test_identity_is_verified_or_refused():
+    neon = sc.describe_target(f"postgresql+asyncpg://u:p@{NEON}-pooler.c-2.eu-central-1.aws.neon.tech/neondb")
+    assert sc.verified_identity(neon, sc.ServerFacts("neondb", True, True)) == f"{NEON}/neondb"
+    tunnel = sc.describe_target("postgresql+asyncpg://u:p@127.0.0.1:6543/neondb")
+    with pytest.raises(sc.SeedRefused, match="non-Neon hostname"):
+        sc.verified_identity(tunnel, sc.ServerFacts("neondb", True, True))
+    assert sc.verified_identity(tunnel, LOCAL_FACTS) == "127.0.0.1/profexia"
+    for url in ("postgresql+asyncpg://u:p@/x?host=a.example:1&host=b.example:2",
+                "postgresql+asyncpg://u:p@/x?host=/tmp", "postgresql+asyncpg://u:p@/x"):
+        with pytest.raises(sc.SeedRefused, match="cannot be verified"):
+            sc.verified_identity(sc.describe_target(url), LOCAL_FACTS)
+
+
+# --------------------------------------------------------------------------- duplicate detection (M2, pure)
+
+
+def _existing(name, slug=None, i=1):
+    return sc.Existing(i, slug, name, name.lower(), None, True)
+
+
+def _spec(slug):
+    return next(s for s in CATALOG.skills if s.slug == slug)
+
+
+@pytest.mark.parametrize("existing,slug", [
+    ("NodeJS", "node-js"),
+    ("node.JS", "node-js"),
+    ("Golang", "go-programming-language"),
+    ("Go", "go-programming-language"),
+    ("JS", "javascript"),
+    ("CPP", "c-plus-plus"),
+    ("C Sharp", "c-sharp"),
+    ("\u0420\u0443thon", "python"),            # Cyrillic Er + U
+    ("\u03a1ython", "python"),                  # Greek Rho
+    ("\uff30\uff59\uff54\uff48\uff4f\uff4e", "python"),  # full-width
 ])
-def test_protected_target_detection(url, env, protected):
-    assert sc.is_protected_target(url, env) is protected
+def test_near_duplicates_are_conflicts(existing, slug):
+    row, reason = sc._match(_spec(slug), [_existing(existing)])
+    assert row is None and reason
+
+
+def test_lookalike_conflict_is_labelled():
+    _, reason = sc._match(_spec("python"), [_existing("\u0420\u0443thon")])
+    assert "look-alike characters" in reason
+
+
+@pytest.mark.parametrize("existing,slug", [
+    ("Java", "javascript"), ("JavaScript", "java"), ("Gopher Care", "go-programming-language"),
+    ("Rust Belt History", "rust"), ("Pythonista Club", "python"), ("C", "c-plus-plus"), ("R", "rust"),
+])
+def test_no_excessive_false_positives(existing, slug):
+    assert sc._match(_spec(slug), [_existing(existing)]) == (None, "")
 
 
 # --------------------------------------------------------------------------- disposable databases
@@ -121,10 +230,9 @@ def _drop(name: str) -> None:
 
 @pytest.fixture(scope="module")
 def seed_template():
-    from tests.conftest import INTEGRATION_AVAILABLE
-
-    if not INTEGRATION_AVAILABLE:
-        pytest.skip("PostgreSQL/Redis not reachable (run inside docker compose or CI)")
+    # conftest switches DATABASE_URL to a "<db>_test" database only when PostgreSQL is reachable.
+    if not urlsplit(settings.database_url).path.endswith("_test"):
+        pytest.skip("PostgreSQL not reachable (run inside docker compose or CI)")
     name = f"profexia_seed_tmpl_{uuid.uuid4().hex[:8]}_test"
     _admin(f'CREATE DATABASE "{name}"')
     try:
@@ -137,7 +245,7 @@ def seed_template():
 
 
 @pytest.fixture
-def db_url(seed_template):
+def db_url(integration, seed_template):
     name = f"profexia_seed_{uuid.uuid4().hex[:8]}_test"
     _admin(f'CREATE DATABASE "{name}" TEMPLATE "{seed_template}"')
     try:
@@ -202,6 +310,30 @@ def test_dry_run_reports_plan_and_writes_nothing(db_url):
     assert plan.counts() == {"category": {"create": N_CATEGORIES, "present": 0, "conflict": 0},
                              "skill": {"create": N_SKILLS, "present": 0, "conflict": 0}}
     assert db(db_url)(_snapshot) == ([], [])
+
+
+def _sqlstate(exc):
+    return getattr(getattr(getattr(exc, "orig", None), "__cause__", None), "sqlstate", None)
+
+
+def test_dry_run_transaction_is_read_only_and_rejects_insert(db_url, monkeypatch):
+    real, seen = sc.build_plan, {}
+
+    async def probing(conn, catalog):
+        plan = await real(conn, catalog)
+        seen["read_only"] = await conn.scalar(text("SELECT current_setting('transaction_read_only')"))
+        try:
+            await conn.execute(text("INSERT INTO skill_categories (slug, name) VALUES ('probe', 'Probe')"))
+        except DBAPIError as exc:
+            seen["insert"] = _sqlstate(exc)
+        return plan
+
+    monkeypatch.setattr(sc, "build_plan", probing)
+    seed(db_url, apply=False)
+    assert seen == {"read_only": "on", "insert": "25006"}  # 25006 = read_only_sql_transaction
+    assert db(db_url)(_snapshot) == ([], [])
+    assert scalar(db_url, "SELECT last_value FROM skill_categories_id_seq") == 1  # no sequence use either
+    assert scalar(db_url, "SELECT is_called FROM skill_categories_id_seq") is False
 
 
 def test_first_run_creates_expected_records(db_url):
@@ -287,6 +419,26 @@ def test_present_records_with_differences_are_reported_not_changed(db_url):
     assert attached == sum(1 for s in CATALOG.skills if s.category == "programming") - 1
 
 
+def test_display_name_difference_is_reported(db_url):
+    db(db_url)(lambda conn: _exec(conn, "INSERT INTO skills (name, slug) VALUES ('python', 'python')"))
+    before = db(db_url)(_snapshot)[1][0]
+    plan = seed(db_url, apply=True)
+    item = next(i for i in plan.items if i.slug == "python" and i.kind == "skill")
+    assert item.action == "present" and "name" in item.reason.split("differs: ")[1].split(", ")
+    assert db(db_url)(_snapshot)[1][0] == before  # not renamed
+
+
+def test_repeated_runs_are_idempotent(db_url):
+    seed(db_url, apply=True)
+    first = db(db_url)(_snapshot)
+    for _ in range(3):
+        plan = seed(db_url, apply=True)
+        assert plan.counts()["skill"] == {"create": 0, "present": N_SKILLS, "conflict": 0}
+        assert plan.counts()["category"] == {"create": 0, "present": N_CATEGORIES, "conflict": 0}
+        assert all(not i.reason for i in plan.items)
+    assert db(db_url)(_snapshot) == first
+
+
 CONFLICTS = {
     "legacy skill, case-only name match, no slug": ("skill", "python",
         "INSERT INTO skills (name) VALUES ('PYTHON')"),
@@ -300,6 +452,11 @@ CONFLICTS = {
         "INSERT INTO skill_categories (slug, name) VALUES ('coding', 'PROGRAMMING')"),
     "category slug taken by another name": ("category", "music",
         "INSERT INTO skill_categories (slug, name) VALUES ('music', 'Music & Dance')"),
+    # M2 regressions
+    "compact key: NodeJS": ("skill", "node-js", "INSERT INTO skills (name) VALUES ('NodeJS')"),
+    "alias: Golang": ("skill", "go-programming-language", "INSERT INTO skills (name) VALUES ('Golang')"),
+    "alias: Go": ("skill", "go-programming-language", "INSERT INTO skills (name, slug) VALUES ('Go', 'go')"),
+    "Cyrillic look-alike": ("skill", "python", "INSERT INTO skills (name) VALUES ('\u0420\u0443thon')"),
 }
 
 
@@ -397,6 +554,95 @@ def test_concurrent_run_is_refused(db_url):
     assert db(db_url)(_snapshot) == ([], [])
 
 
+async def _raw(url):
+    import asyncpg
+    return await asyncpg.connect(url.replace("+asyncpg", "", 1))
+
+
+def test_seed_blocks_competing_writer_between_plan_and_insert(db_url, monkeypatch):
+    """M3: while the seed holds its table locks, an API-style INSERT cannot slip in."""
+    import asyncpg
+
+    real, seen = sc.build_plan, {}
+
+    async def planned_then_compete(conn, catalog):
+        plan = await real(conn, catalog)
+        writer = await _raw(db_url)
+        try:
+            await writer.execute("SET lock_timeout = '300ms'")
+            try:
+                await writer.execute("INSERT INTO skills (name) VALUES ('NodeJS')")
+                seen["writer"] = "inserted"
+            except asyncpg.exceptions.LockNotAvailableError:
+                seen["writer"] = "blocked"
+        finally:
+            await writer.close()
+        return plan
+
+    monkeypatch.setattr(sc, "build_plan", planned_then_compete)
+    plan = seed(db_url, apply=True)
+    assert seen == {"writer": "blocked"}
+    assert plan.counts()["skill"]["create"] == N_SKILLS
+    assert scalar(db_url, "SELECT count(*) FROM skills WHERE name = 'NodeJS'") == 0
+
+
+def test_competing_writer_blocks_seed_then_is_detected(db_url, monkeypatch):
+    """M3: an uncommitted competing INSERT makes the seed time out (nothing written); once it
+    commits, the next seed sees it as a near-duplicate conflict instead of duplicating it."""
+    monkeypatch.setattr(sc, "LOCK_TIMEOUT", "500ms")
+
+    async def scenario():
+        writer = await _raw(db_url)
+        engine = _engine(db_url)
+        try:
+            tx = writer.transaction()
+            await tx.start()
+            await writer.execute("INSERT INTO skills (name) VALUES ('NodeJS')")
+            with pytest.raises(sc.SeedError, match="not committed") as info:
+                await sc.run(engine, CATALOG, apply=True)
+            assert info.value.exit_code == sc.EXIT_DB_ERROR
+            await tx.commit()
+            with pytest.raises(sc.SeedConflicts) as conflicts:
+                await sc.run(engine, CATALOG, apply=True)
+            assert ("skill", "node-js") in {(i.kind, i.slug) for i in conflicts.value.plan.conflicts}
+        finally:
+            await writer.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+    assert scalar(db_url, "SELECT count(*) FROM skill_categories") == 0
+    assert scalar(db_url, "SELECT count(*) FROM skills") == 1
+
+
+def test_identity_rechecked_inside_write_transaction(db_url):
+    actual = db(db_url)(sc.server_facts)
+    for wrong in (sc.ServerFacts("some_other_db", actual.ssl, actual.neon),
+                  sc.ServerFacts(actual.database, actual.ssl, True)):
+        with pytest.raises(sc.SeedRefused, match="differs"):
+            seed(db_url, apply=True, expected=wrong)
+    assert db(db_url)(_snapshot) == ([], [])
+    assert seed(db_url, apply=True, expected=actual).counts()["skill"]["create"] == N_SKILLS
+
+
+@pytest.mark.parametrize("committed", [True, False])
+def test_commit_failure_reports_unknown_outcome(db_url, monkeypatch, committed):
+    """L3: a lost COMMIT acknowledgement must not be reported as a rollback."""
+    async def flaky_commit(trans):
+        if committed:
+            await trans.commit()
+        raise ConnectionResetError("simulated: connection lost during COMMIT")
+
+    monkeypatch.setattr(sc, "_commit", flaky_commit)
+    with pytest.raises(sc.SeedOutcomeUnknown, match="UNKNOWN") as info:
+        seed(db_url, apply=True)
+    assert info.value.exit_code == sc.EXIT_OUTCOME_UNKNOWN and "rolled back" not in str(info.value)
+    assert len(db(db_url)(_snapshot)[1]) == (N_SKILLS if committed else 0)
+    monkeypatch.undo()
+    plan = seed(db_url, apply=True)  # re-running is safe either way
+    assert plan.counts()["skill"]["create"] == (0 if committed else N_SKILLS)
+    assert len(db(db_url)(_snapshot)[1]) == N_SKILLS
+
+
 # --------------------------------------------------------------------------- command line
 
 
@@ -406,18 +652,27 @@ def _cli(url, *args, environment="development"):
                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
 
 
-def _assert_no_connection_details(result, url):
+def _assert_no_connection_details(result, url, *, identity_shown=False):
+    """Never the URL, credentials or host:port. The database name may appear only as part of
+    the target identity printed for protected databases."""
     output = result.stdout + result.stderr
     parts = urlsplit(url)
-    for secret in (url, f"{parts.username}:{parts.password}", f"{parts.hostname}:{parts.port}",
-                   parts.path.lstrip("/")):
+    secrets = [url, f"{parts.username}:{parts.password}", f"{parts.hostname}:{parts.port}"]
+    if not identity_shown:
+        secrets.append(parts.path.lstrip("/"))
+    for secret in secrets:
         assert secret and secret not in output
+
+
+def _identity(url):
+    return f"127.0.0.1/{urlsplit(url).path.lstrip('/')}"
 
 
 def test_cli_dry_run_then_apply_then_rerun(db_url):
     r = _cli(db_url)
     assert r.returncode == 0, r.stderr
     assert f"would create: {N_SKILLS}" in r.stdout and "nothing was written" in r.stdout
+    assert "verified local database" in r.stdout
     assert db(db_url)(_snapshot) == ([], [])
 
     r = _cli(db_url, "--apply")
@@ -437,18 +692,33 @@ def test_cli_conflict_exit_code(db_url):
     _assert_no_connection_details(r, db_url)
 
 
-@pytest.mark.parametrize("args", [["--apply"], ["--apply", "--confirm-production"]])
-def test_cli_protected_target_requires_explicit_confirmation(db_url, args):
-    r = _cli(db_url, *args, environment="production")
-    assert r.returncode == sc.EXIT_REFUSED
+@pytest.mark.parametrize("extra", [
+    [], ["--confirm-production"], ["--target", "IDENTITY"],
+    ["--confirm-production", "--target", "127.0.0.1/some_other_db"],
+    ["--confirm-production", "--target", "IDENTITY"],  # correct, but no interactive terminal
+])
+def test_cli_protected_target_requires_target_and_confirmation(db_url, extra):
+    extra = [_identity(db_url) if a == "IDENTITY" else a for a in extra]
+    r = _cli(db_url, "--apply", *extra, environment="production")
+    assert r.returncode == sc.EXIT_REFUSED, r.stdout + r.stderr
     assert db(db_url)(_snapshot) == ([], [])
-    _assert_no_connection_details(r, db_url)
+    _assert_no_connection_details(r, db_url, identity_shown=True)
 
 
-def test_cli_protected_dry_run_is_allowed(db_url):
+def test_cli_protected_dry_run_prints_identity(db_url):
     r = _cli(db_url, environment="production")
-    assert r.returncode == 0 and "PROTECTED" in r.stdout
+    assert r.returncode == 0 and "PROTECTED" in r.stdout and f"identity: {_identity(db_url)}" in r.stdout
     assert db(db_url)(_snapshot) == ([], [])
+    _assert_no_connection_details(r, db_url, identity_shown=True)
+
+
+def test_cli_localhost_host_override_bypass_is_refused_before_connecting():
+    """H1 regression: netloc 'localhost' with ?host=<remote> used to be treated as local."""
+    url = ("postgresql+asyncpg://neon_user:s3cret-pw@localhost/neondb"
+           "?host=ep-late-example-123456-pooler.c-2.eu-central-1.aws.neon.tech")
+    r = _cli(url, "--apply")
+    assert r.returncode == sc.EXIT_REFUSED and "--target" in r.stderr
+    assert "s3cret-pw" not in r.stdout + r.stderr and "neon.tech" not in r.stdout + r.stderr
 
 
 def test_cli_unreachable_database_reports_class_only():
@@ -459,10 +729,36 @@ def test_cli_unreachable_database_reports_class_only():
     assert "s3cret-pw" not in r.stdout + r.stderr
 
 
-def test_main_confirmation_phrase(db_url, monkeypatch):
+def test_main_target_specific_confirmation_phrase(db_url, monkeypatch):
     monkeypatch.setattr(settings, "database_url", normalize_database_url(db_url))
     monkeypatch.setattr(settings, "environment", "production")
-    assert sc.main(["--apply", "--confirm-production"], read_phrase=lambda: "seed production") == sc.EXIT_REFUSED
+    args = ["--apply", "--confirm-production", "--target", _identity(db_url)]
+    asked = []
+    assert sc.main(args, read_phrase=lambda p: asked.append(p) or "seed profexia production") == sc.EXIT_REFUSED
+    assert asked == [f"seed {_identity(db_url)}"]
     assert db(db_url)(_snapshot) == ([], [])
-    assert sc.main(["--apply", "--confirm-production"], read_phrase=lambda: sc.CONFIRM_PHRASE) == sc.EXIT_OK
+    assert sc.main(args, read_phrase=lambda p: p) == sc.EXIT_OK
     assert len(db(db_url)(_snapshot)[1]) == N_SKILLS
+
+
+@pytest.mark.parametrize("facts", [
+    {"ssl": True, "neon": False}, {"ssl": False, "neon": True}, {"ssl": True, "neon": True},
+])
+def test_main_localhost_tunnel_to_managed_server_is_protected(db_url, monkeypatch, facts):
+    """H1 regression: a loopback URL whose server looks managed (SSL / Neon) is protected, and a
+    Neon server behind a loopback/IP host can never be written to (identity unverifiable)."""
+    monkeypatch.setattr(settings, "database_url", normalize_database_url(db_url))
+    monkeypatch.setattr(settings, "environment", "development")
+    real_probe = sc._probe
+
+    async def managed_probe(engine):
+        actual = await real_probe(engine)
+        return sc.ServerFacts(actual.database, **facts)
+
+    monkeypatch.setattr(sc, "_probe", managed_probe)
+    assert sc.main(["--apply"], read_phrase=lambda p: p) == sc.EXIT_REFUSED
+    full = ["--apply", "--confirm-production", "--target", _identity(db_url)]
+    # Neon behind a loopback host: refused outright. SSL-only: identity verifies, but the
+    # in-transaction re-check sees the real (non-SSL) server and refuses.
+    assert sc.main(full, read_phrase=lambda p: p) == sc.EXIT_REFUSED
+    assert db(db_url)(_snapshot) == ([], [])

@@ -20,12 +20,13 @@
   ],
   "skills": [
     {"slug": "python", "name": "Python", "category": "programming"},
-    {"slug": "javascript", "name": "JavaScript", "category": "programming"},
+    {"slug": "javascript", "name": "JavaScript", "category": "programming", "aliases": ["JS"]},
     {"slug": "typescript", "name": "TypeScript", "category": "programming"},
     {"slug": "java", "name": "Java", "category": "programming"},
-    {"slug": "c-plus-plus", "name": "C++", "category": "programming"},
+    {"slug": "c-plus-plus", "name": "C++", "category": "programming", "aliases": ["CPP"]},
     {"slug": "c-sharp", "name": "C#", "category": "programming"},
-    {"slug": "go", "name": "Go", "category": "programming"},
+    {"slug": "go-programming-language", "name": "Go (Programming Language)", "category": "programming",
+     "aliases": ["Go", "Golang"]},
     {"slug": "rust", "name": "Rust", "category": "programming"},
     {"slug": "sql", "name": "SQL", "category": "programming"},
 
