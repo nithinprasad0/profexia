@@ -150,6 +150,8 @@ Migrations are **additive only** (`alembic upgrade head`). Nothing in this proje
 
 - **As a release step (paid Render plans):** set `RUN_MIGRATIONS_ON_STARTUP=false` and add a Pre-Deploy Command `alembic upgrade head && python -m app.infrastructure.seed` in the Render dashboard.
 
+The skill catalogue is **not** seeded by any of the above; it is a separate, explicit, reviewed step — see [SKILL_CATALOGUE.md](SKILL_CATALOGUE.md#production-runbook).
+
 Back up before risky changes: Neon supports branches/point-in-time restore — create a branch before running new migrations in production.
 
 **Free-tier notes (check https://neon.tech/pricing for current limits):** small storage quota, compute that suspends when idle (the first query after idle takes a moment while it resumes; the backend's `pool_pre_ping` and `pool_recycle` handle dropped connections), and limited compute hours. Suitable for demos/portfolios, not for guaranteed production uptime.

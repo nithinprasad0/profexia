@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "categories": [
+    {"slug": "programming", "name": "Programming", "sort_order": 10,
+     "description": "General-purpose programming languages and core coding skills."},
+    {"slug": "web-development", "name": "Web Development", "sort_order": 20,
+     "description": "Building websites, web applications and APIs."},
+    {"slug": "data-ai", "name": "Data & AI", "sort_order": 30,
+     "description": "Data analysis, statistics, machine learning and business intelligence."},
+    {"slug": "design", "name": "Design & Media", "sort_order": 40,
+     "description": "Visual design, user experience, photography and video."},
+    {"slug": "languages", "name": "Languages", "sort_order": 50,
+     "description": "Spoken and written human languages."},
+    {"slug": "music", "name": "Music", "sort_order": 60,
+     "description": "Instruments, singing and music theory."},
+    {"slug": "business", "name": "Business & Communication", "sort_order": 70,
+     "description": "Communication, marketing, management and finance."},
+    {"slug": "academics", "name": "Academics", "sort_order": 80,
+     "description": "School and university subjects."}
+  ],
+  "skills": [
+    {"slug": "python", "name": "Python", "category": "programming"},
+    {"slug": "javascript", "name": "JavaScript", "category": "programming", "aliases": ["JS"]},
+    {"slug": "typescript", "name": "TypeScript", "category": "programming"},
+    {"slug": "java", "name": "Java", "category": "programming"},
+    {"slug": "c-plus-plus", "name": "C++", "category": "programming", "aliases": ["CPP"]},
+    {"slug": "c-sharp", "name": "C#", "category": "programming"},
+    {"slug": "go-programming-language", "name": "Go (Programming Language)", "category": "programming",
+     "aliases": ["Go", "Golang"]},
+    {"slug": "rust", "name": "Rust", "category": "programming"},
+    {"slug": "sql", "name": "SQL", "category": "programming"},
+
+    {"slug": "html-css", "name": "HTML & CSS", "category": "web-development"},
+    {"slug": "react", "name": "React", "category": "web-development"},
+    {"slug": "node-js", "name": "Node.js", "category": "web-development"},
+    {"slug": "fastapi", "name": "FastAPI", "category": "web-development"},
+    {"slug": "django", "name": "Django", "category": "web-development"},
+    {"slug": "rest-api-design", "name": "REST API Design", "category": "web-development"},
+
+    {"slug": "data-analysis", "name": "Data Analysis", "category": "data-ai"},
+    {"slug": "machine-learning", "name": "Machine Learning", "category": "data-ai"},
+    {"slug": "statistics", "name": "Statistics", "category": "data-ai"},
+    {"slug": "excel", "name": "Excel", "category": "data-ai"},
+    {"slug": "power-bi", "name": "Power BI", "category": "data-ai"},
+
+    {"slug": "ui-ux-design", "name": "UI/UX Design", "category": "design"},
+    {"slug": "figma", "name": "Figma", "category": "design"},
+    {"slug": "graphic-design", "name": "Graphic Design", "category": "design"},
+    {"slug": "photography", "name": "Photography", "category": "design"},
+    {"slug": "video-editing", "name": "Video Editing", "category": "design"},
+
+    {"slug": "english", "name": "English", "category": "languages"},
+    {"slug": "hindi", "name": "Hindi", "category": "languages"},
+    {"slug": "malayalam", "name": "Malayalam", "category": "languages"},
+    {"slug": "tamil", "name": "Tamil", "category": "languages"},
+    {"slug": "spanish", "name": "Spanish", "category": "languages"},
+    {"slug": "french", "name": "French", "category": "languages"},
+    {"slug": "german", "name": "German", "category": "languages"},
+    {"slug": "japanese", "name": "Japanese", "category": "languages"},
+
+    {"slug": "guitar", "name": "Guitar", "category": "music"},
+    {"slug": "piano", "name": "Piano", "category": "music"},
+    {"slug": "singing", "name": "Singing", "category": "music"},
+    {"slug": "music-theory", "name": "Music Theory", "category": "music"},
+
+    {"slug": "public-speaking", "name": "Public Speaking", "category": "business"},
+    {"slug": "digital-marketing", "name": "Digital Marketing", "category": "business"},
+    {"slug": "product-management", "name": "Product Management", "category": "business"},
+    {"slug": "accounting", "name": "Accounting", "category": "business"},
+
+    {"slug": "mathematics", "name": "Mathematics", "category": "academics"},
+    {"slug": "physics", "name": "Physics", "category": "academics"},
+    {"slug": "chemistry", "name": "Chemistry", "category": "academics"},
+    {"slug": "biology", "name": "Biology", "category": "academics"}
+  ]
+}
