@@ -161,6 +161,9 @@ python -m app.infrastructure.seed
 uvicorn app.main:app --reload
 ```
 
+Optional starter skill catalogue (never run automatically; dry run unless `--apply`):
+`python -m app.infrastructure.seed_catalog` — see [docs/SKILL_CATALOGUE.md](docs/SKILL_CATALOGUE.md).
+
 More: [docs/BACKEND.md](docs/BACKEND.md), [frontend/README.md](frontend/README.md).
 
 ## Environment configuration
