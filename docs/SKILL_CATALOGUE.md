@@ -37,6 +37,10 @@ preload library). These are **informational**. They do not and cannot detect eve
 database behind a tunnel. A tunnel to a non-Neon server that terminates TLS locally looks
 exactly like a local server.
 
+The Neon-specific behaviour has **not been verified against a live Neon server**: the Neon
+signature check, the endpoint-ID rule for Neon hostnames, and the pooler behaviour. The tests
+use a local PostgreSQL and hostnames in Neon's documented format.
+
 So every `--apply` requires all three of:
 1. `--confirm-production`.
 2. `--target <identity>`, where the identity is `<endpoint>/<database>`. The endpoint comes
@@ -48,6 +52,13 @@ So every `--apply` requires all three of:
      `db.internal.example.com:5432`, `127.0.0.1:55432` or `[::1]:6000`. The host is never
      shortened, and the port is included, so two tunnels on different ports never share an
      identity.
+   - **IPv6.** Addresses are always shown in brackets, `[addr]:port`, and zone identifiers are
+     kept, as in `[fe80::1%eth0]:6001`.
+     - A bracketed `?host=[::1]` or `?host=[::1]:6000` is unbracketed before it reaches the
+       driver. SQLAlchemy would otherwise pass the brackets through and asyncpg would try to
+       resolve `[::1]` as a hostname.
+     - A port inside the brackets plus another port anywhere else counts as "port given
+       twice", and is refused.
    - The database is `current_database()` reported by the server.
    - **Port rules:**
      - The port comes from the URL (`:port` or `?port=`). With no port, it is 5432.
@@ -55,9 +66,13 @@ So every `--apply` requires all three of:
        there is no identity. The dry run says so and `--apply` is refused.
      - Invalid ports are refused, never silently defaulted: `:0`, an empty or non-numeric
        `?port=`, out-of-range values, or `port` given twice.
-   - **Pinning.** The verified host and port are passed to the driver as explicit
-     connection arguments. The driver therefore dials exactly the endpoint you confirmed;
-     `PGHOST` and `PGPORT` can't redirect it.
+   - **What actually protects against a wrong port is the refusal rule above.** asyncpg only
+     falls back to `PGPORT` when no port is given, and that case has no identity.
+     (`PGHOST` matters only when there is no host, which is also refused.)
+   - **Pinning is defence in depth.** The verified host and port are *also* passed to the
+     driver as explicit connection arguments. With today's rules the driver would dial the
+     same address without them; pinning only guards against a future gap between the identity
+     and the URL.
    - The script **refuses** when the identity can't be verified:
      - several hosts;
      - a Unix socket;
@@ -79,8 +94,27 @@ So every `--apply` requires all three of:
 4. The write transaction starts on **that same connection**. It re-reads the server facts
    before taking locks or writing, and any difference aborts the run.
 
-The connection is closed on success, on refusal, on errors and on Ctrl-C. The write can't
-silently land on a different server reached by a fresh connection.
+The connection is closed on success, on refusal, on errors and on interruption. The write
+can't silently land on a different server reached by a fresh connection.
+
+**Ctrl-C at the confirmation prompt.** The prompt is a blocking terminal read inside
+`asyncio.run`. Observed on Linux with Python 3.12, the version the Docker image and CI use:
+- The **first** Ctrl-C cancels the run, but the prompt keeps waiting.
+- If you then press Enter, **even after typing the correct phrase**, the run stops at its next
+  step with a cancellation, before the write transaction starts. Nothing is written, the
+  connection is closed, and the process exits with KeyboardInterrupt.
+- A **second** Ctrl-C ends the prompt immediately, with the same result.
+
+Windows terminals were not tested and may behave differently. In every case, nothing is
+written until the phrase is confirmed and the run has not been cancelled.
+
+**Interruption during COMMIT.** A Ctrl-C (KeyboardInterrupt) or a task cancellation
+(`asyncio.CancelledError`) while COMMIT is in flight is **not swallowed or retried**:
+- The script prints `ABORTED: COMMIT interrupted (...); the outcome is UNKNOWN …` to stderr.
+- It attaches the same note to the exception, then lets the original interruption propagate.
+- The exit status is the interpreter's usual one for that interruption, not one of the codes
+  below.
+- Run the dry run to see what was written; re-running is safe.
 
 **What this does *not* guarantee:**
 - **The identity doesn't prove where the endpoint leads.** It proves which host and port
@@ -89,7 +123,8 @@ silently land on a different server reached by a fresh connection.
   using the Neon endpoint hostname in production, not a tunnel.
 - **"Same connection" means the same client socket.** Through a transaction-mode pooler
   (Neon's `-pooler` host), the pooler may hand each transaction to a different backend
-  process. They all belong to the same Neon endpoint and database.
+  process. They are expected to serve the same endpoint and database, but this has not been
+  tested against a live Neon pooler.
 - **A long pause can lose the connection.** If the confirmation takes a long time, the server
   or pooler may close the idle connection; Neon suspends idle computes. The write then fails
   before COMMIT, so nothing is written, and you just run it again.
@@ -97,11 +132,11 @@ silently land on a different server reached by a fresh connection.
 | Exit code | Meaning |
 |---|---|
 | 0 | Dry run or apply succeeded |
-| 1 | Refused: unsupported revision, missing or mismatched target or confirmation, unverifiable identity, or another seed running |
+| 1 | Refused: unsupported revision, missing or mismatched target or confirmation, unverifiable identity, a failed confirmation prompt (terminal/input error), or another seed running. Nothing was written |
 | 2 | Conflicts found; nothing written |
 | 3 | Invalid catalogue file; database not touched |
-| 4 | Database error before COMMIT; the transaction was not committed, so nothing was written |
-| 5 | COMMIT failed; **outcome unknown**. Run the dry run to see what was written. Re-running is safe |
+| 4 | Failure before COMMIT; the transaction was not committed, so nothing was written. The message says which: `database connection or query failed (…)` (driver, network or server) or `unexpected internal error (…)` (a bug) |
+| 5 | COMMIT failed with an ordinary error; **outcome unknown**. Run the dry run to see what was written. Re-running is safe |
 
 ## Behaviour
 

@@ -149,6 +149,17 @@ PORT_CASES = [
     ("postgresql+asyncpg://u:p@[::1]/db", "6000", None),
     ("postgresql+asyncpg://u:p@[::1]/db", None, "[::1]:5432"),
     ("postgresql+asyncpg://u:p@[::1]:6000/db", "7000", "[::1]:6000"),
+    # bracketed IPv6 passed through ?host= (SQLAlchemy keeps the brackets): normalised, then pinned bare
+    ("postgresql+asyncpg://u:p@/db?host=[::1]", None, "[::1]:5432"),
+    ("postgresql+asyncpg://u:p@/db?host=[::1]", "6000", None),
+    ("postgresql+asyncpg://u:p@/db?host=[::1]&port=6000", "7000", "[::1]:6000"),
+    ("postgresql+asyncpg://u:p@/db?host=[::1]:6000", "7000", "[::1]:6000"),
+    ("postgresql+asyncpg://u:p@/db?host=[fe80::1%25eth0]:6001", None, "[fe80::1%eth0]:6001"),
+    ("postgresql+asyncpg://u:p@/db?host=[2001:db8::5]", None, "[2001:db8::5]:5432"),
+    ("postgresql+asyncpg://u:p@h.example:5433/db?host=[::1]:6000", None, None),  # port given twice
+    ("postgresql+asyncpg://u:p@/db?host=[::1]:", None, None),
+    ("postgresql+asyncpg://u:p@/db?host=[::1]:0", None, None),
+    ("postgresql+asyncpg://u:p@/db?host=[not-an-ip]", None, None),
     (f"postgresql+asyncpg://u:p@{NEON}.c-2.eu-central-1.aws.neon.tech/neondb", "6000", None),
     (f"postgresql+asyncpg://u:p@{NEON}.c-2.eu-central-1.aws.neon.tech:5432/neondb", "6000", NEON),
     # malformed values: refused, never silently defaulted
@@ -198,6 +209,19 @@ def test_pinned_connect_args_are_what_asyncpg_dials(url, pgport, endpoint, monke
     if not t.neon_host:
         host, _, port = endpoint.rpartition(":")
         assert (host.strip("[]"), int(port)) == (t.hosts[0], t.port)
+
+
+@pytest.mark.parametrize("url,host", [
+    ("postgresql+asyncpg://u:p@/db?host=[::1]", "::1"),
+    ("postgresql+asyncpg://u:p@/db?host=[::1]:6000", "::1"),
+    ("postgresql+asyncpg://u:p@/db?host=[fe80::1%25eth0]&port=6001", "fe80::1%eth0"),
+    ("postgresql+asyncpg://u:p@[::1]:6000/db", "::1"),
+])
+def test_bracketed_ipv6_is_pinned_without_brackets(url, host, monkeypatch):
+    monkeypatch.delenv("PGPORT", raising=False)
+    t = sc.describe_target(url)
+    assert t.hosts == (host,) and t.connect_args()["host"] == host
+    assert t.endpoint.startswith(f"[{host}]:")  # identity keeps unambiguous [addr]:port formatting
 
 
 def test_describe_target_never_raises_or_echoes_url():
@@ -935,7 +959,7 @@ def test_apply_uses_the_verified_connection_and_is_idle_during_prompt(db_url, mo
 
 
 @pytest.mark.parametrize("behaviour", ["wrong phrase", "no terminal", "exception", "keyboard interrupt"])
-def test_connection_closed_after_failed_confirmation(db_url, monkeypatch, behaviour):
+def test_connection_closed_after_failed_confirmation(db_url, monkeypatch, capsys, behaviour):
     _use(monkeypatch, db_url)
 
     def prompt(phrase):
@@ -952,15 +976,103 @@ def test_connection_closed_after_failed_confirmation(db_url, monkeypatch, behavi
         with pytest.raises(KeyboardInterrupt):
             sc.main(args, read_phrase=prompt)
     else:
-        assert sc.main(args, read_phrase=prompt) in (sc.EXIT_REFUSED, sc.EXIT_DB_ERROR)
+        assert sc.main(args, read_phrase=prompt) == sc.EXIT_REFUSED
+    err = capsys.readouterr().err
+    if behaviour == "exception":
+        assert "confirmation prompt failed (RuntimeError)" in err and "database" not in err
     assert asyncio.run(_activity(db_url)) == []  # no connection left open
     assert db(db_url)(_snapshot) == ([], [])
+
+
+def test_unexpected_internal_error_is_not_reported_as_a_database_failure(db_url, monkeypatch, capsys):
+    _use(monkeypatch, db_url)
+
+    async def broken(conn, catalog):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(sc, "build_plan", broken)
+    assert sc.main([]) == sc.EXIT_DB_ERROR
+    err = capsys.readouterr().err
+    assert "unexpected internal error (RuntimeError)" in err and "database connection" not in err
+    assert "nothing was written" in err
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, asyncio.CancelledError])
+@pytest.mark.parametrize("committed", [True, False])
+def test_interruption_during_commit_reports_unknown_outcome_and_propagates(db_url, monkeypatch, capsys,
+                                                                          interruption, committed):
+    """KeyboardInterrupt / CancelledError while COMMIT is in flight: the original interruption
+    propagates unchanged (cancellation is not swallowed, nothing is retried) and the outcome is
+    reported as UNKNOWN."""
+    calls = []
+
+    async def interrupted_commit(trans):
+        calls.append(1)
+        if committed:
+            await trans.commit()
+        raise interruption()
+
+    monkeypatch.setattr(sc, "_commit", interrupted_commit)
+    with pytest.raises(interruption) as info:
+        seed(db_url, apply=True)
+    assert calls == [1]  # no retry
+    assert getattr(info.value, "seed_outcome_unknown", False) is True
+    assert any("outcome is UNKNOWN" in n for n in getattr(info.value, "__notes__", []))
+    assert "outcome is UNKNOWN" in capsys.readouterr().err
+    assert len(db(db_url)(_snapshot)[1]) == (N_SKILLS if committed else 0)
+    monkeypatch.undo()
+    assert seed(db_url, apply=True).counts()["skill"]["create"] == (0 if committed else N_SKILLS)
+
+
+def test_real_task_cancellation_during_commit_propagates(db_url, monkeypatch, capsys):
+    """A genuine task.cancel() while COMMIT is pending: CancelledError reaches the caller."""
+    started = None
+
+    async def slow_commit(trans):
+        started.set()
+        await asyncio.sleep(30)  # cancelled here, before the real COMMIT is sent
+        await trans.commit()
+
+    monkeypatch.setattr(sc, "_commit", slow_commit)
+
+    async def scenario():
+        nonlocal started
+        started = asyncio.Event()
+        engine = _engine(db_url)
+        try:
+            task = asyncio.create_task(sc.run(engine, CATALOG, apply=True))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert task.cancelled()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+    assert "COMMIT interrupted (CancelledError)" in capsys.readouterr().err
+    assert db(db_url)(_snapshot) == ([], [])  # cancelled before COMMIT was sent: nothing persisted
+
+
+def test_keyboard_interrupt_during_commit_via_cli_closes_connection(db_url, monkeypatch, capsys):
+    _use(monkeypatch, db_url)
+
+    async def interrupted_commit(trans):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sc, "_commit", interrupted_commit)
+    args = ["--apply", "--confirm-production", "--target", _identity(db_url)]
+    with pytest.raises(KeyboardInterrupt):
+        sc.main(args, read_phrase=lambda p: p)
+    assert "outcome is UNKNOWN" in capsys.readouterr().err
+    assert asyncio.run(_activity(db_url)) == []
 
 
 def test_cli_unreachable_database_reports_class_only():
     url = "postgresql+asyncpg://nobody:s3cret-pw@127.0.0.1:1/profexia_nowhere_test"
     r = _cli(url)
     assert r.returncode == sc.EXIT_DB_ERROR and "Traceback" not in r.stderr
+    assert "database connection or query failed" in r.stderr and "internal error" not in r.stderr
     _assert_no_connection_details(r, url)
     assert "s3cret-pw" not in r.stdout + r.stderr
 

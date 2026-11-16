@@ -16,10 +16,11 @@ The identity is "<endpoint>/<database>", where <endpoint> is the Neon endpoint I
 Neon hostname (ep-xxx[-pooler].<region>.neon.tech -> ep-xxx) and "<host>:<port>" for
 any other single host (the full effective host the driver dials, so two tunnels on
 different ports never share an identity). Host and port are resolved from the URL the
-way SQLAlchemy hands them to asyncpg (after `?host=` / `?port=` overrides) and are then
-pinned as explicit connection arguments, so the driver dials exactly the confirmed
-endpoint (PGHOST/PGPORT cannot redirect it). A URL without a port while PGPORT is set,
-or with an invalid port, has no identity. The script refuses when the identity cannot
+way SQLAlchemy hands them to asyncpg (after `?host=` / `?port=` overrides; brackets
+around an IPv6 `?host=` are removed). A URL without a port while PGPORT is set, or with
+an invalid port, has no identity: that refusal is what prevents an ambiguous default
+port. As defence in depth, the verified host and port are also pinned as explicit
+connection arguments. The script refuses when the identity cannot
 be verified (multiple hosts, Unix socket, no host, invalid/ambiguous port, or a server
 with a Neon signature reached through a non-Neon hostname). The dry run prints it.
 
@@ -448,10 +449,28 @@ def _is_ip(host: str) -> bool:
         return False
 
 
-def _effective_port(url, raw_ports, raw_query: str = "") -> tuple[int | None, str]:
+_BRACKETED_IP_RE = re.compile(r"^\[([^\[\]]+)\](?::([^:\[\]]*))?$")
+
+
+def _split_bracketed_ip(host: str) -> tuple[str, str | None] | None:
+    """'[::1]' -> ('::1', None), '[fe80::1%eth0]:6000' -> ('fe80::1%eth0', '6000'); None if `host`
+    is not a bracketed IP literal. SQLAlchemy strips brackets from the URL's address part but
+    passes `?host=[::1]` through verbatim, which asyncpg would then try to resolve as a name."""
+    m = _BRACKETED_IP_RE.fullmatch(host)
+    if not m:
+        return None
+    try:
+        ipaddress.ip_address(m.group(1))
+    except ValueError:
+        return None
+    return m.group(1), m.group(2)
+
+
+def _effective_port(url, raw_ports, raw_query: str = "", host_port: str | None = None) -> tuple[int | None, str]:
     """The port asyncpg will use, or (None, reason) when it cannot be determined reliably.
     SQLAlchemy silently drops ':0' and an empty '?port=', and passes out-of-range values on;
-    asyncpg falls back to PGPORT when no port is given. All of those are refused here."""
+    asyncpg falls back to PGPORT when no port is given. All of those are refused here.
+    `host_port` is a port written inside a bracketed IPv6 `?host=[addr]:port`."""
     if url.port is not None and not 1 <= url.port <= 65535:
         return None, "invalid port"
     # Check the raw query too: make_url drops blank values such as "?port=".
@@ -462,6 +481,12 @@ def _effective_port(url, raw_ports, raw_query: str = "") -> tuple[int | None, st
                                     and 1 <= int(values[0]) <= 65535):
             return None, "invalid port"
     port = raw_ports[0] if isinstance(raw_ports, (list, tuple)) else raw_ports
+    if host_port is not None:
+        if port is not None:
+            return None, "port given twice (in ?host=[...]:port and elsewhere)"
+        if not (host_port.isdigit() and 1 <= int(host_port) <= 65535):
+            return None, "invalid port"
+        return int(host_port), ""
     if port is None:
         if os.environ.get("PGPORT") is not None:
             return None, "no port in the URL while PGPORT is set (effective port ambiguous)"
@@ -483,6 +508,9 @@ def describe_target(database_url: str) -> Target:
         return Target((), False, None, False, ("unparseable database URL",))
     raw_hosts, raw_ports = kw.get("host"), kw.get("port")
     hosts = tuple(raw_hosts) if isinstance(raw_hosts, (list, tuple)) else ((raw_hosts,) if raw_hosts else ())
+    host_port = None
+    if len(hosts) == 1 and (bracketed := _split_bracketed_ip(hosts[0])):
+        hosts, host_port = (bracketed[0],), bracketed[1]  # bare address is what gets pinned
     ssl = kw.get("ssl")
     ssl_requested = ssl not in (None, False, "disable")
     notes = []
@@ -497,7 +525,7 @@ def describe_target(database_url: str) -> Target:
         notes.append("unrecognised host")
     else:
         h = hosts[0].lower().strip("[]")
-        port, why = _effective_port(url, raw_ports, urlsplit(database_url).query)
+        port, why = _effective_port(url, raw_ports, urlsplit(database_url).query, host_port)
         match = NEON_HOST_RE.fullmatch(h)
         if port is None:
             notes.append(why)
@@ -618,6 +646,11 @@ def _not_committed(exc: Exception) -> SeedError:
                      "the transaction was not committed, nothing was written")
 
 
+def _outcome_unknown_message(what: str) -> str:
+    return (f"{what}; the outcome is UNKNOWN. "
+            "Run the dry run again to see what was written (re-running is safe).")
+
+
 async def run_on_connection(conn: AsyncConnection, catalog: Catalog, *, apply: bool,
                             skip_conflicts: bool = False, expected: ServerFacts | None = None) -> Plan:
     """Run on an already-open connection that is not inside a transaction. Dry runs use a
@@ -648,15 +681,26 @@ async def run_on_connection(conn: AsyncConnection, catalog: Catalog, *, apply: b
                 pass
             raise
         stage = "commit"
-        await _commit(trans)
+        try:
+            await _commit(trans)
+        except Exception:
+            raise  # ordinary failure: mapped to SeedOutcomeUnknown below
+        except BaseException as exc:
+            # KeyboardInterrupt / asyncio.CancelledError while COMMIT is in flight: the server may
+            # or may not have committed. Report that, then let the interruption propagate unchanged
+            # (never swallow cancellation, never retry).
+            message = _outcome_unknown_message(f"COMMIT interrupted ({type(exc).__name__})")
+            print(f"ABORTED: {message}", file=sys.stderr)
+            exc.add_note(message)
+            exc.seed_outcome_unknown = True
+            raise
         return plan
     except SeedError:
         raise
     except Exception as exc:
         if stage == "commit":
-            raise SeedOutcomeUnknown(
-                f"COMMIT failed ({type(getattr(exc, 'orig', exc)).__name__}); the outcome is UNKNOWN. "
-                "Run the dry run again to see what was written (re-running is safe).") from None
+            raise SeedOutcomeUnknown(_outcome_unknown_message(
+                f"COMMIT failed ({type(getattr(exc, 'orig', exc)).__name__})")) from None
         if isinstance(exc, DBAPIError):
             raise _not_committed(exc) from None
         raise
@@ -682,6 +726,14 @@ async def run(engine: AsyncEngine, catalog: Catalog, *, apply: bool, skip_confli
 
 
 # --------------------------------------------------------------------------- CLI
+
+
+def _is_database_error(exc: BaseException) -> bool:
+    """Driver, network and server errors (as opposed to bugs or terminal/input failures)."""
+    import asyncpg
+
+    return isinstance(exc, (DBAPIError, OSError, TimeoutError, asyncio.TimeoutError,
+                            asyncpg.PostgresError, asyncpg.InterfaceError))
 
 
 def _read_phrase(phrase: str) -> str | None:
@@ -736,7 +788,7 @@ def main(argv: list[str] | None = None, *,
     def session(catalog: Catalog, target: Target) -> Plan:
         options = engine_options(settings.database_url)
         pinned = target.connect_args()
-        if pinned:  # the driver dials exactly the endpoint in the identity (PGHOST/PGPORT cannot redirect it)
+        if pinned:  # defence in depth; the PGPORT/invalid-port refusal is the primary protection
             options["connect_args"] = {**options.get("connect_args", {}), **pinned}
 
         async def go() -> Plan:
@@ -762,8 +814,14 @@ def main(argv: list[str] | None = None, *,
             return asyncio.run(go())
         except SeedError:
             raise
-        except Exception as exc:  # noqa: BLE001 - driver errors may embed host or DB names: class only
-            raise SeedError(f"database unavailable or failed ({type(exc).__name__}); nothing was written") from None
+        except Exception as exc:  # noqa: BLE001 - messages may embed host or DB names: class only
+            # Every path that reaches here is before COMMIT (COMMIT failures are SeedOutcomeUnknown
+            # and post-COMMIT release errors return the plan), so nothing was written.
+            if _is_database_error(exc):
+                raise SeedError(f"database connection or query failed ({type(exc).__name__}); "
+                                "nothing was written") from None
+            raise SeedError(f"unexpected internal error ({type(exc).__name__}) before any write was "
+                            "committed; nothing was written") from None
 
     def _show_and_confirm(target: Target, facts: ServerFacts) -> str | None:
         notes = target_notes(target, facts, settings.environment)
@@ -784,7 +842,12 @@ def main(argv: list[str] | None = None, *,
                                   f"({identity}); nothing was written")
             phrase = f"seed {identity}"
             # Blocking prompt while the connection is idle: no transaction, no locks held.
-            if read_phrase(phrase) != phrase:
+            try:
+                answer = read_phrase(phrase)
+            except Exception as exc:  # input/terminal failure, not a database problem
+                raise SeedRefused(f"confirmation prompt failed ({type(exc).__name__}); "
+                                  "nothing was written") from None
+            if answer != phrase:
                 raise SeedRefused("confirmation phrase not entered (an interactive terminal is required)")
         return identity
 
