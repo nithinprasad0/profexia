@@ -665,7 +665,8 @@ def _assert_no_connection_details(result, url, *, identity_shown=False):
 
 
 def _identity(url):
-    return f"127.0.0.1/{urlsplit(url).path.lstrip('/')}"
+    parts = urlsplit(url)  # loopback hosts are used whole (127.0.0.1 locally, localhost in CI)
+    return f"{parts.hostname}/{parts.path.lstrip('/')}"
 
 
 def test_cli_dry_run_then_apply_then_rerun(db_url):
