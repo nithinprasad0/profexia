@@ -10,55 +10,62 @@ Seeding a database always takes an explicit command.
 ## Commands
 
 ```bash
-# 1. Dry run (default): validates the file, identifies the target, checks the revision,
+# 1. Dry run (default): validates the file, prints the target identity, checks the revision,
 #    prints the plan. Writes nothing (READ ONLY transaction).
 python -m app.infrastructure.seed_catalog
 
-# 2. Apply to a verified local database (docker compose / CI)
-python -m app.infrastructure.seed_catalog --apply
-
-# 3. Apply to a protected database (production, Neon, anything not verified local).
-#    The dry run prints the exact --target value. You must then type: seed <target>
-python -m app.infrastructure.seed_catalog --apply --confirm-production --target ep-example-123456/neondb
+# 2. Apply. This is the same for every database, local or not. Copy the identity printed by
+#    the dry run, then type the phrase it asks for: seed <identity>
+python -m app.infrastructure.seed_catalog --apply --confirm-production --target <identity>
+#    e.g. --target localhost:5432/profexia        (docker compose)
+#         --target ep-example-123456/neondb       (Neon)
 ```
 
 The database comes from `DATABASE_URL`, read through the app settings. The URL and credentials
-are never printed. The only thing shown is the target identity: the endpoint label and the
-database name.
+are never printed. The only thing shown is the target identity: host and port (or the Neon
+endpoint ID) and the database name.
 
 ## Target identification
 
-A database counts as **local** only if *all* of these hold:
-- `ENVIRONMENT` is not `production`.
-- The driver dials exactly one loopback host: `localhost`, `127.0.0.0/8`, `::1`, the
-  docker-compose `postgres` service, or `*.localhost`. This is resolved the way
-  SQLAlchemy/asyncpg actually connect, so a `?host=` override in the URL counts.
-- No SSL is requested in the URL.
-- The connected **server** uses no SSL for this session and shows no Neon signature
-  (`neon.*` settings or the `neon` preload library).
+**Every database is treated as protected. There is no automatic "local" exemption.** A client
+cannot prove that a database is local:
+- `localhost` or `127.0.0.1` may be an SSH tunnel or proxy to any server;
+- a name such as `postgres` may resolve to any machine.
 
-Everything else is **protected**, including:
-- `localhost?host=<remote>`;
-- several hosts, a Unix socket, or no host at all;
-- an SSH tunnel or proxy on `127.0.0.1` that forwards to Neon.
+The script also reports SSL use and a Neon server signature (`neon.*` settings or the `neon`
+preload library). These are **informational**. They do not and cannot detect every remote
+database behind a tunnel. A tunnel to a non-Neon server that terminates TLS locally looks
+exactly like a local server.
 
-On a protected database, `--apply` requires all three of:
+So every `--apply` requires all three of:
 1. `--confirm-production`.
-2. `--target <endpoint>/<database>`. This is verified against the host the driver actually
-   dials and against `current_database()` on the server:
-   - On Neon, the endpoint is the host's first label without `-pooler`, for example
-     `ep-example-123456`.
-   - On an IP or loopback host, it is the host itself.
+2. `--target <identity>`, where the identity is `<endpoint>/<database>`. The endpoint is worked
+   out from the host the driver **actually dials**, so `?host=` overrides in the URL are taken
+   into account:
+   - A Neon hostname (`ep-<id>[-pooler].<region>….neon.tech`) gives the Neon endpoint ID,
+     for example `ep-example-123456`. The pooler and direct hostnames give the same ID.
+   - **Any other single host** gives the full host and port, for example
+     `db.internal.example.com:5432` or `127.0.0.1:55432`. The host is never shortened, and
+     the port is included, so two tunnels on different ports never share an identity.
+   - The database is `current_database()` reported by the server.
    - The script **refuses** when the identity can't be verified:
      - several hosts;
      - a Unix socket;
      - no host;
-     - a Neon server reached through a tunnel, proxy or IP.
-3. Typing `seed <endpoint>/<database>` at an interactive terminal. The phrase is specific to
-   that target. Without a terminal the script refuses.
+     - an unrecognised host;
+     - a server with a Neon signature reached through a non-Neon hostname, such as a tunnel,
+       proxy or IP.
+   - A target that doesn't match is refused before the prompt and before any write.
+3. Typing `seed <identity>` at an interactive terminal. The phrase is specific to that target.
+   Without a terminal the script refuses.
 
 The server facts (database name, SSL, Neon signature) are read once before confirmation.
 They are read **again inside the write transaction**, and any difference aborts the run.
+
+**What this does *not* guarantee:** the identity proves which host and port the client dials
+and which database name the server reports. It cannot prove *where* that host and port really
+lead. The operator has to recognise the identity, and the runbook below requires using the
+Neon endpoint hostname in production, not a tunnel.
 
 | Exit code | Meaning |
 |---|---|
@@ -193,7 +200,10 @@ Remove-Item Env:DATABASE_URL
 ```
 
 Use the endpoint **hostname** URL from the Neon console (direct or `-pooler`), not a tunnel.
-Otherwise the identity can't be verified and the script refuses.
+Only then is the identity the Neon endpoint ID (`ep-…/neondb`).
+- Through a tunnel to Neon, the script refuses if it detects the Neon signature.
+- Through a tunnel to any other server, the identity would just be the tunnel's
+  `host:port`. That proves nothing about where the tunnel leads.
 
 1. Check the target is at `0006_member_profiles_skills` (`alembic current`).
 2. Create a Neon backup branch.

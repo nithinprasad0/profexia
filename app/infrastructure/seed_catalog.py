@@ -4,21 +4,22 @@ This is never run automatically (not by docker-entrypoint.sh, not at app startup
 Run it by hand:
 
     python -m app.infrastructure.seed_catalog              # dry run: shows the plan, writes nothing
-    python -m app.infrastructure.seed_catalog --apply      # writes (verified local database only)
+    python -m app.infrastructure.seed_catalog --apply --confirm-production --target <identity>
 
-Target classification. A database is "local" only if every signal agrees:
-ENVIRONMENT is not production; the driver dials exactly one loopback host
-(localhost, 127.0.0.0/8, ::1, the docker-compose "postgres" service, *.localhost);
-no SSL is requested; and the connected server itself uses no SSL and shows no Neon
-signature. Everything else (remote hosts, `?host=` overrides, multiple hosts, Unix
-sockets, missing hosts, tunnels to a managed server) is "protected".
+Every database is treated as protected. A client cannot prove that a database is
+local: "localhost" or "127.0.0.1" may be a tunnel to any server, and a name such as
+"postgres" may resolve anywhere. So there is no automatic local exemption: every
+write needs --apply --confirm-production --target <identity> and typing
+"seed <identity>" at an interactive prompt.
 
-Writing to a protected database needs:
-    --apply --confirm-production --target <endpoint>/<database>
-and typing "seed <endpoint>/<database>" at an interactive prompt. The identity is
-verified against the host the driver actually dials and current_database(); if it
-cannot be verified (multiple hosts, Unix socket, a Neon server reached through a
-tunnel or IP), the script refuses. The dry run prints the identity to use.
+The identity is "<endpoint>/<database>", where <endpoint> is the Neon endpoint ID for a
+Neon hostname (ep-xxx[-pooler].<region>.neon.tech -> ep-xxx) and "<host>:<port>" for
+any other single host (the full effective host the driver dials, so two tunnels on
+different ports never share an identity). It is compared with the host the driver
+actually dials (after `?host=` overrides) and with current_database() on the server,
+then re-checked inside the write transaction. The script refuses when the identity
+cannot be verified (multiple hosts, Unix socket, no host, or a server with a Neon
+signature reached through a non-Neon hostname). The dry run prints the identity.
 
 Behaviour:
 - The database must be at a supported Alembic revision (0006). Nothing is migrated.
@@ -68,7 +69,9 @@ SUPPORTED_REVISIONS = frozenset({"0006_member_profiles_skills"})
 # Arbitrary fixed key for pg_try_advisory_xact_lock ("profexia catalogue seed").
 ADVISORY_LOCK_KEY = 7_041_202_606
 LOCK_TIMEOUT = "5s"
-LOOPBACK_NAMES = frozenset({"localhost", "postgres"})  # "postgres" = docker-compose service
+# Neon hostnames: ep-<id>[-pooler].<region...>.neon.tech -> endpoint ID "ep-<id>".
+NEON_HOST_RE = re.compile(r"^(ep-[a-z0-9]+(?:-[a-z0-9]+)*?)(?:-pooler)?\.(?:[a-z0-9-]+\.)*neon\.tech$")
+DEFAULT_PORT = 5432
 
 CATEGORY_SLUG_MAX = 80
 CATEGORY_NAME_MAX = 80
@@ -396,8 +399,9 @@ class Target:
     """What the driver will actually dial, derived from the URL exactly as asyncpg receives it."""
     hosts: tuple[str, ...]
     ssl_requested: bool
-    endpoint: str | None  # verifiable endpoint label, None when ambiguous
-    problems: tuple[str, ...]  # reasons the URL alone is not a verified local target
+    endpoint: str | None  # Neon endpoint ID, "<host>:<port>" for any other single host, None if ambiguous
+    neon_host: bool
+    notes: tuple[str, ...]  # informational only; nothing here makes a target "local"
 
 
 @dataclass(frozen=True)
@@ -410,7 +414,7 @@ class ServerFacts:
 
 def _is_loopback(host: str) -> bool:
     h = host.lower().strip("[]")
-    if h in LOOPBACK_NAMES or h.endswith(".localhost"):
+    if h == "localhost" or h.endswith(".localhost"):
         return True
     try:
         return ipaddress.ip_address(h).is_loopback
@@ -418,9 +422,13 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
+_HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$")
+
+
 def _is_ip(host: str) -> bool:
+    h = host[1:-1] if host.startswith("[") and host.endswith("]") else host
     try:
-        ipaddress.ip_address(host.strip("[]"))
+        ipaddress.ip_address(h)
         return True
     except ValueError:
         return False
@@ -432,32 +440,38 @@ def describe_target(database_url: str) -> Target:
     try:
         url = make_url(database_url)
         if url.get_backend_name() != "postgresql" or url.get_driver_name() != "asyncpg":
-            return Target((), False, None, ("unrecognised database URL",))
+            return Target((), False, None, False, ("unrecognised database URL",))
         _, kw = PGDialect_asyncpg().create_connect_args(url)
     except Exception:  # noqa: BLE001 - never echo the URL
-        return Target((), False, None, ("unparseable database URL",))
-    raw = kw.get("host")
-    hosts = tuple(raw) if isinstance(raw, (list, tuple)) else ((raw,) if raw else ())
+        return Target((), False, None, False, ("unparseable database URL",))
+    raw_hosts, raw_ports = kw.get("host"), kw.get("port")
+    hosts = tuple(raw_hosts) if isinstance(raw_hosts, (list, tuple)) else ((raw_hosts,) if raw_hosts else ())
     ssl = kw.get("ssl")
     ssl_requested = ssl not in (None, False, "disable")
-    problems = []
+    notes = []
+    endpoint, neon_host = None, False
     if not hosts:
-        problems.append("no explicit host (driver defaults / PGHOST)")
+        notes.append("no explicit host (driver defaults / PGHOST)")
     elif len(hosts) > 1:
-        problems.append("multiple hosts")
+        notes.append("multiple hosts")
     elif hosts[0].startswith("/"):
-        problems.append("Unix socket")
-    elif not _is_loopback(hosts[0]):
-        problems.append("non-loopback host")
-    if ssl_requested:
-        problems.append("SSL requested")
-    endpoint = None
-    if len(hosts) == 1 and not hosts[0].startswith("/"):
+        notes.append("Unix socket")
+    elif not (_is_ip(hosts[0]) or _HOSTNAME_RE.fullmatch(hosts[0].lower())):
+        notes.append("unrecognised host")
+    else:
         h = hosts[0].lower().strip("[]")
-        # Managed DNS names (e.g. Neon) identify the endpoint by their first label; IPs and
-        # loopback names are used whole.
-        endpoint = h if _is_ip(h) or _is_loopback(h) or "." not in h else h.split(".", 1)[0].removesuffix("-pooler")
-    return Target(hosts, ssl_requested, endpoint, tuple(problems))
+        port = raw_ports[0] if isinstance(raw_ports, (list, tuple)) else raw_ports
+        match = NEON_HOST_RE.fullmatch(h)
+        if match:
+            endpoint, neon_host = match.group(1), True
+            notes.append("Neon hostname")
+        else:
+            endpoint = f"[{h}]:{port or DEFAULT_PORT}" if ":" in h else f"{h}:{port or DEFAULT_PORT}"
+            notes.append("loopback host (may still be a tunnel to another server)" if _is_loopback(h)
+                         else "network host")
+    if ssl_requested:
+        notes.append("SSL requested")
+    return Target(hosts, ssl_requested, endpoint, neon_host, tuple(notes))
 
 
 async def server_facts(conn: AsyncConnection) -> ServerFacts:
@@ -469,16 +483,17 @@ async def server_facts(conn: AsyncConnection) -> ServerFacts:
     return ServerFacts(database=row[0], ssl=bool(row[1]), neon=bool(row[2]))
 
 
-def classify(target: Target, facts: ServerFacts, environment: str) -> list[str]:
-    """Reasons the target is protected; an empty list means a verified local database."""
-    reasons = list(target.problems)
+def target_notes(target: Target, facts: ServerFacts, environment: str) -> list[str]:
+    """What is known about the target, for the operator. Informational: every target is
+    protected regardless, because locality cannot be proven from the client."""
+    notes = list(target.notes)
     if environment == "production":
-        reasons.insert(0, "ENVIRONMENT=production")
+        notes.insert(0, "ENVIRONMENT=production")
     if facts.ssl:
-        reasons.append("server connection uses SSL")
+        notes.append("server connection uses SSL")
     if facts.neon:
-        reasons.append("Neon server detected")
-    return reasons
+        notes.append("Neon server signature")
+    return notes
 
 
 def verified_identity(target: Target, facts: ServerFacts) -> str:
@@ -486,9 +501,10 @@ def verified_identity(target: Target, facts: ServerFacts) -> str:
     if target.endpoint is None:
         raise SeedRefused("target identity cannot be verified (multiple hosts, Unix socket or no host); "
                           "nothing was written")
-    if facts.neon and not target.hosts[0].lower().endswith(".neon.tech"):
-        raise SeedRefused("a Neon server was reached through a non-Neon hostname (tunnel, proxy or IP), so "
-                          "its endpoint cannot be verified; connect with the endpoint hostname. Nothing was written")
+    if facts.neon and not target.neon_host:
+        raise SeedRefused("a server with a Neon signature was reached through a non-Neon hostname (tunnel, "
+                          "proxy or IP), so its endpoint cannot be verified; connect with the endpoint "
+                          "hostname. Nothing was written")
     return f"{target.endpoint}/{facts.database}"
 
 
@@ -653,9 +669,9 @@ def main(argv: list[str] | None = None, *,
     parser.add_argument("--skip-conflicts", action="store_true",
                         help="seed non-conflicting items and leave conflicting ones out (default: abort)")
     parser.add_argument("--confirm-production", action="store_true",
-                        help="required with --apply for any protected (non-verified-local) database")
-    parser.add_argument("--target", metavar="ENDPOINT/DATABASE",
-                        help="required with --apply for protected databases; the dry run prints the value")
+                        help="required with --apply (every database is treated as protected)")
+    parser.add_argument("--target", metavar="IDENTITY",
+                        help="required with --apply: <endpoint>/<database> as printed by the dry run")
     parser.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
@@ -679,30 +695,23 @@ def main(argv: list[str] | None = None, *,
     try:
         catalog = load_catalog(args.catalog)
         target = describe_target(settings.database_url)
-        url_protected = bool(target.problems) or settings.environment == "production"
-        if args.apply and url_protected and not (args.confirm_production and args.target):
-            raise SeedRefused("protected database: --apply also requires --confirm-production and "
-                              "--target ENDPOINT/DATABASE (run the dry run to see the target)")
+        if args.apply and not (args.confirm_production and args.target):
+            raise SeedRefused("--apply also requires --confirm-production and --target IDENTITY for every "
+                              "database (run the dry run to see the identity); nothing was written")
         facts = with_engine(_probe)
-        reasons = classify(target, facts, settings.environment)
+        notes = target_notes(target, facts, settings.environment)
         print(f"Catalogue v{catalog.version}: {len(catalog.categories)} categories, {len(catalog.skills)} skills. "
               f"Mode: {'APPLY' if args.apply else 'dry run (no writes)'}.")
         identity = None
-        if reasons:
-            try:
-                identity = verified_identity(target, facts)
-            except SeedRefused as exc:
-                if args.apply:
-                    raise
-                print(f"Target: PROTECTED ({'; '.join(reasons)}); identity NOT verifiable: {exc}")
-            else:
-                print(f"Target: PROTECTED ({'; '.join(reasons)}); identity: {identity}")
+        try:
+            identity = verified_identity(target, facts)
+        except SeedRefused as exc:
+            if args.apply:
+                raise
+            print(f"Target: PROTECTED ({'; '.join(notes)}); identity NOT verifiable: {exc}")
         else:
-            print("Target: verified local database (loopback host, no SSL, not a managed server).")
-        if args.apply and reasons:
-            if not (args.confirm_production and args.target):
-                raise SeedRefused("protected database: --apply also requires --confirm-production and "
-                                  "--target ENDPOINT/DATABASE")
+            print(f"Target: PROTECTED ({'; '.join(notes)}); identity: {identity}")
+        if args.apply:
             if args.target != identity:
                 raise SeedRefused(f"--target {args.target!r} does not match the connected database "
                                   f"({identity}); nothing was written")

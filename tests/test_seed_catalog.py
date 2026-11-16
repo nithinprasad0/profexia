@@ -104,57 +104,73 @@ def test_design_media_media_split_is_rejected_instead_of_self_conflicting():
 
 NEON = "ep-late-example-123456"
 TARGETS = {
-    # url -> (effective hosts, verified-local URL?, endpoint)
-    "postgresql+asyncpg://u:p@127.0.0.1:5432/x": (("127.0.0.1",), True, "127.0.0.1"),
-    "postgresql+asyncpg://u:p@localhost/x": (("localhost",), True, "localhost"),
-    "postgresql+asyncpg://u:p@postgres:5432/x": (("postgres",), True, "postgres"),
-    "postgresql+asyncpg://u:p@db.localhost/x": (("db.localhost",), True, "db.localhost"),
-    "postgresql+asyncpg://u:p@[::1]:5432/x": (("::1",), True, "::1"),
+    # url -> (effective hosts, identity endpoint, Neon hostname?)
+    "postgresql+asyncpg://u:p@127.0.0.1:5432/x": (("127.0.0.1",), "127.0.0.1:5432", False),
+    "postgresql+asyncpg://u:p@localhost/x": (("localhost",), "localhost:5432", False),
+    "postgresql+asyncpg://u:p@postgres:5432/x": (("postgres",), "postgres:5432", False),
+    "postgresql+asyncpg://u:p@db.localhost/x": (("db.localhost",), "db.localhost:5432", False),
+    "postgresql+asyncpg://u:p@[::1]:5433/x": (("::1",), "[::1]:5433", False),
     # H1 regression: the netloc says localhost but asyncpg dials the ?host= value.
     f"postgresql+asyncpg://u:p@localhost/neondb?host={NEON}-pooler.c-2.eu-central-1.aws.neon.tech":
-        ((f"{NEON}-pooler.c-2.eu-central-1.aws.neon.tech",), False, NEON),
+        ((f"{NEON}-pooler.c-2.eu-central-1.aws.neon.tech",), NEON, True),
     normalize_database_url(f"postgresql://u:p@{NEON}.c-2.eu-central-1.aws.neon.tech/neondb?sslmode=require"):
-        ((f"{NEON}.c-2.eu-central-1.aws.neon.tech",), False, NEON),
-    "postgresql+asyncpg://u:p@127.0.0.1/x?ssl=require": (("127.0.0.1",), False, "127.0.0.1"),
-    "postgresql+asyncpg://u:p@/x?host=localhost:5432&host=127.0.0.1:5433": (("localhost", "127.0.0.1"), False, None),
-    "postgresql+asyncpg://u:p@/x?host=/var/run/postgresql": (("/var/run/postgresql",), False, None),
-    "postgresql+asyncpg://u:p@/x": ((), False, None),
-    "postgresql+asyncpg://u:p@10.0.0.5/x": (("10.0.0.5",), False, "10.0.0.5"),
-    "mysql://u:p@localhost/x": ((), False, None),
+        ((f"{NEON}.c-2.eu-central-1.aws.neon.tech",), NEON, True),
+    # Non-Neon DNS names keep the full host (and port): no first-label truncation.
+    "postgresql+asyncpg://u:p@db.internal.example.com:6000/x": (("db.internal.example.com",),
+                                                               "db.internal.example.com:6000", False),
+    "postgresql+asyncpg://u:p@ep-lookalike.example.com/x": (("ep-lookalike.example.com",),
+                                                           "ep-lookalike.example.com:5432", False),
+    "postgresql+asyncpg://u:p@proxy.neon.tech/x": (("proxy.neon.tech",), "proxy.neon.tech:5432", False),
+    "postgresql+asyncpg://u:p@127.0.0.1/x?ssl=require": (("127.0.0.1",), "127.0.0.1:5432", False),
+    "postgresql+asyncpg://u:p@/x?host=localhost:5432&host=127.0.0.1:5433": (("localhost", "127.0.0.1"), None, False),
+    "postgresql+asyncpg://u:p@/x?host=/var/run/postgresql": (("/var/run/postgresql",), None, False),
+    "postgresql+asyncpg://u:p@/x": ((), None, False),
+    "postgresql+asyncpg://u:p@10.0.0.5/x": (("10.0.0.5",), "10.0.0.5:5432", False),
+    "mysql://u:p@localhost/x": ((), None, False),
 }
 
 
 @pytest.mark.parametrize("url", list(TARGETS), ids=[str(i) for i in range(len(TARGETS))])
 def test_describe_target_uses_effective_driver_host(url):
-    hosts, local, endpoint = TARGETS[url]
+    hosts, endpoint, neon_host = TARGETS[url]
     t = sc.describe_target(url)
-    assert (t.hosts, not t.problems, t.endpoint) == (hosts, local, endpoint)
+    assert (t.hosts, t.endpoint, t.neon_host) == (hosts, endpoint, neon_host)
 
 
 def test_describe_target_never_raises_or_echoes_url():
     t = sc.describe_target("postgresql+asyncpg://u:s3cret@[bad")
-    assert t.problems and "s3cret" not in repr(t)
+    assert t.notes and t.endpoint is None and "s3cret" not in repr(t)
 
 
 LOCAL_FACTS = sc.ServerFacts("profexia", ssl=False, neon=False)
 
 
-def test_classify_requires_every_signal_to_be_local():
-    local = sc.describe_target("postgresql+asyncpg://u:p@127.0.0.1/profexia")
-    assert sc.classify(local, LOCAL_FACTS, "development") == []
-    assert "ENVIRONMENT=production" in sc.classify(local, LOCAL_FACTS, "production")
-    # Localhost tunnel to a managed server: the URL looks local, the server does not.
-    assert sc.classify(local, sc.ServerFacts("neondb", ssl=True, neon=False), "development")
-    assert sc.classify(local, sc.ServerFacts("neondb", ssl=False, neon=True), "development")
+def test_notes_never_claim_locality():
+    """Locality cannot be proven from the client: loopback is flagged as a possible tunnel and
+    'postgres' is just a network host name."""
+    loop = sc.target_notes(sc.describe_target("postgresql+asyncpg://u:p@127.0.0.1/profexia"), LOCAL_FACTS, "development")
+    assert any("may still be a tunnel" in n for n in loop)
+    pg = sc.target_notes(sc.describe_target("postgresql+asyncpg://u:p@postgres:5432/profexia"), LOCAL_FACTS, "development")
+    assert pg == ["network host"]
+    assert not hasattr(sc, "classify") and not hasattr(sc, "LOOPBACK_NAMES")
+    notes = sc.target_notes(sc.describe_target("postgresql+asyncpg://u:p@127.0.0.1/x"),
+                            sc.ServerFacts("neondb", ssl=True, neon=True), "production")
+    assert notes[0] == "ENVIRONMENT=production" and "server connection uses SSL" in notes
+    assert "Neon server signature" in notes
 
 
 def test_identity_is_verified_or_refused():
-    neon = sc.describe_target(f"postgresql+asyncpg://u:p@{NEON}-pooler.c-2.eu-central-1.aws.neon.tech/neondb")
-    assert sc.verified_identity(neon, sc.ServerFacts("neondb", True, True)) == f"{NEON}/neondb"
+    for host in (f"{NEON}-pooler.c-2.eu-central-1.aws.neon.tech", f"{NEON}.c-2.eu-central-1.aws.neon.tech"):
+        neon = sc.describe_target(f"postgresql+asyncpg://u:p@{host}/neondb")
+        assert sc.verified_identity(neon, sc.ServerFacts("neondb", True, True)) == f"{NEON}/neondb"
+    dns = sc.describe_target("postgresql+asyncpg://u:p@db.internal.example.com/app")
+    assert sc.verified_identity(dns, LOCAL_FACTS) == "db.internal.example.com:5432/profexia"
     tunnel = sc.describe_target("postgresql+asyncpg://u:p@127.0.0.1:6543/neondb")
-    with pytest.raises(sc.SeedRefused, match="non-Neon hostname"):
-        sc.verified_identity(tunnel, sc.ServerFacts("neondb", True, True))
-    assert sc.verified_identity(tunnel, LOCAL_FACTS) == "127.0.0.1/profexia"
+    assert sc.verified_identity(tunnel, LOCAL_FACTS) == "127.0.0.1:6543/profexia"
+    for not_neon_host in (tunnel, sc.describe_target("postgresql+asyncpg://u:p@proxy.neon.tech/neondb"),
+                          sc.describe_target("postgresql+asyncpg://u:p@postgres/neondb")):
+        with pytest.raises(sc.SeedRefused, match="non-Neon hostname"):
+            sc.verified_identity(not_neon_host, sc.ServerFacts("neondb", True, True))
     for url in ("postgresql+asyncpg://u:p@/x?host=a.example:1&host=b.example:2",
                 "postgresql+asyncpg://u:p@/x?host=/tmp", "postgresql+asyncpg://u:p@/x"):
         with pytest.raises(sc.SeedRefused, match="cannot be verified"):
@@ -653,54 +669,66 @@ def _cli(url, *args, environment="development"):
 
 
 def _assert_no_connection_details(result, url, *, identity_shown=False):
-    """Never the URL, credentials or host:port. The database name may appear only as part of
-    the target identity printed for protected databases."""
+    """Never the URL or credentials. host:port and the database name may appear only as the
+    printed target identity."""
     output = result.stdout + result.stderr
     parts = urlsplit(url)
-    secrets = [url, f"{parts.username}:{parts.password}", f"{parts.hostname}:{parts.port}"]
+    secrets = [url, f"{parts.username}:{parts.password}", f"{parts.username}:{parts.password}@"]
     if not identity_shown:
-        secrets.append(parts.path.lstrip("/"))
+        secrets += [f"{parts.hostname}:{parts.port}", parts.path.lstrip("/")]
     for secret in secrets:
         assert secret and secret not in output
 
 
-def _identity(url):
-    parts = urlsplit(url)  # loopback hosts are used whole (127.0.0.1 locally, localhost in CI)
-    return f"{parts.hostname}/{parts.path.lstrip('/')}"
+def _identity(url, database=None, port=None):
+    """Expected identity for a non-Neon test URL: full host:port/database (127.0.0.1 locally,
+    localhost in CI)."""
+    parts = urlsplit(url)
+    return f"{parts.hostname}:{port or parts.port or 5432}/{database or parts.path.lstrip('/')}"
 
 
-def test_cli_dry_run_then_apply_then_rerun(db_url):
+def _use(monkeypatch, url, environment="development"):
+    monkeypatch.setattr(settings, "database_url", normalize_database_url(url))
+    monkeypatch.setattr(settings, "environment", environment)
+
+
+def test_cli_dry_run_then_apply_then_rerun(db_url, monkeypatch):
     r = _cli(db_url)
     assert r.returncode == 0, r.stderr
     assert f"would create: {N_SKILLS}" in r.stdout and "nothing was written" in r.stdout
-    assert "verified local database" in r.stdout
+    assert "PROTECTED" in r.stdout and f"identity: {_identity(db_url)}" in r.stdout
+    assert "may still be a tunnel" in r.stdout and "verified local" not in r.stdout
     assert db(db_url)(_snapshot) == ([], [])
+    _assert_no_connection_details(r, db_url, identity_shown=True)
 
-    r = _cli(db_url, "--apply")
+    _use(monkeypatch, db_url)
+    args = ["--apply", "--confirm-production", "--target", _identity(db_url)]
+    assert sc.main(args, read_phrase=lambda p: p) == sc.EXIT_OK
+    assert len(db(db_url)(_snapshot)[1]) == N_SKILLS
+    assert sc.main(args, read_phrase=lambda p: p) == sc.EXIT_OK  # re-run: nothing new
+    r = _cli(db_url)
     assert r.returncode == 0, r.stderr
-    assert f"created: {N_SKILLS}" in r.stdout
-    r = _cli(db_url, "--apply")
-    assert r.returncode == 0, r.stderr
-    assert "created: 0" in r.stdout and f"already present: {N_SKILLS}" in r.stdout
-    _assert_no_connection_details(r, db_url)
+    assert "would create: 0" in r.stdout and f"already present: {N_SKILLS}" in r.stdout
 
 
 def test_cli_conflict_exit_code(db_url):
     db(db_url)(lambda conn: _exec(conn, "INSERT INTO skills (name) VALUES ('Python')"))
-    r = _cli(db_url, "--apply")
+    r = _cli(db_url)
     assert r.returncode == sc.EXIT_CONFLICTS
     assert "CONFLICT" in r.stdout and "python" in r.stdout and "ABORTED" in r.stderr
-    _assert_no_connection_details(r, db_url)
+    _assert_no_connection_details(r, db_url, identity_shown=True)
 
 
+@pytest.mark.parametrize("environment", ["production", "development"])
 @pytest.mark.parametrize("extra", [
     [], ["--confirm-production"], ["--target", "IDENTITY"],
-    ["--confirm-production", "--target", "127.0.0.1/some_other_db"],
+    ["--confirm-production", "--target", "WRONG_DB"],
     ["--confirm-production", "--target", "IDENTITY"],  # correct, but no interactive terminal
 ])
-def test_cli_protected_target_requires_target_and_confirmation(db_url, extra):
-    extra = [_identity(db_url) if a == "IDENTITY" else a for a in extra]
-    r = _cli(db_url, "--apply", *extra, environment="production")
+def test_cli_protected_target_requires_target_and_confirmation(db_url, extra, environment):
+    swap = {"IDENTITY": _identity(db_url), "WRONG_DB": _identity(db_url, database="some_other_db")}
+    extra = [swap.get(a, a) for a in extra]
+    r = _cli(db_url, "--apply", *extra, environment=environment)
     assert r.returncode == sc.EXIT_REFUSED, r.stdout + r.stderr
     assert db(db_url)(_snapshot) == ([], [])
     _assert_no_connection_details(r, db_url, identity_shown=True)
@@ -711,6 +739,45 @@ def test_cli_protected_dry_run_prints_identity(db_url):
     assert r.returncode == 0 and "PROTECTED" in r.stdout and f"identity: {_identity(db_url)}" in r.stdout
     assert db(db_url)(_snapshot) == ([], [])
     _assert_no_connection_details(r, db_url, identity_shown=True)
+
+
+@pytest.mark.parametrize("environment", ["development", "test"])
+def test_cli_postgres_hostname_cannot_bypass_confirmation(environment):
+    """'postgres' (the docker-compose service name) is not proof of locality: --apply without the
+    explicit target confirmation is refused before any connection is attempted."""
+    url = "postgresql+asyncpg://profexia:s3cret-pw@postgres:5432/profexia"
+    r = _cli(url, "--apply", environment=environment)
+    assert r.returncode == sc.EXIT_REFUSED and "--confirm-production" in r.stderr and "--target" in r.stderr
+    assert "s3cret-pw" not in r.stdout + r.stderr
+
+
+def test_localhost_that_looks_local_is_still_protected(db_url, monkeypatch):
+    """The real local server (loopback URL, no SSL, no Neon signature, ENVIRONMENT=development)
+    is the strongest 'looks local' case; it still needs the full confirmation flow."""
+    _use(monkeypatch, db_url)
+    asked = []
+    for args in (["--apply"], ["--apply", "--confirm-production"], ["--apply", "--target", _identity(db_url)]):
+        assert sc.main(args, read_phrase=lambda p: asked.append(p) or p) == sc.EXIT_REFUSED
+    assert asked == [] and db(db_url)(_snapshot) == ([], [])
+
+
+def test_target_mismatch_is_rejected_before_writes(db_url, monkeypatch):
+    _use(monkeypatch, db_url)
+    other_host = "localhost" if urlsplit(db_url).hostname == "127.0.0.1" else "127.0.0.1"
+    port = urlsplit(db_url).port or 5432
+    wrong = [
+        _identity(db_url, database="some_other_db"),
+        _identity(db_url, port=port + 1),
+        f"{other_host}:{port}/{urlsplit(db_url).path.lstrip('/')}",  # an alias of the same server
+        urlsplit(db_url).path.lstrip("/"),                             # database only
+        f"{urlsplit(db_url).hostname}/{urlsplit(db_url).path.lstrip('/')}",  # host without port
+    ]
+    asked = []
+    for target in wrong:
+        args = ["--apply", "--confirm-production", "--target", target]
+        assert sc.main(args, read_phrase=lambda p: asked.append(p) or p) == sc.EXIT_REFUSED
+    assert asked == []  # refused before the confirmation prompt and before any write
+    assert db(db_url)(_snapshot) == ([], [])
 
 
 def test_cli_localhost_host_override_bypass_is_refused_before_connecting():
@@ -731,8 +798,7 @@ def test_cli_unreachable_database_reports_class_only():
 
 
 def test_main_target_specific_confirmation_phrase(db_url, monkeypatch):
-    monkeypatch.setattr(settings, "database_url", normalize_database_url(db_url))
-    monkeypatch.setattr(settings, "environment", "production")
+    _use(monkeypatch, db_url, "production")
     args = ["--apply", "--confirm-production", "--target", _identity(db_url)]
     asked = []
     assert sc.main(args, read_phrase=lambda p: asked.append(p) or "seed profexia production") == sc.EXIT_REFUSED
@@ -748,8 +814,7 @@ def test_main_target_specific_confirmation_phrase(db_url, monkeypatch):
 def test_main_localhost_tunnel_to_managed_server_is_protected(db_url, monkeypatch, facts):
     """H1 regression: a loopback URL whose server looks managed (SSL / Neon) is protected, and a
     Neon server behind a loopback/IP host can never be written to (identity unverifiable)."""
-    monkeypatch.setattr(settings, "database_url", normalize_database_url(db_url))
-    monkeypatch.setattr(settings, "environment", "development")
+    _use(monkeypatch, db_url)
     real_probe = sc._probe
 
     async def managed_probe(engine):
