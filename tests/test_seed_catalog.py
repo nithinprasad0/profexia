@@ -137,6 +137,69 @@ def test_describe_target_uses_effective_driver_host(url):
     assert (t.hosts, t.endpoint, t.neon_host) == (hosts, endpoint, neon_host)
 
 
+PORT_CASES = [
+    # (url, PGPORT, expected endpoint)  -- None means: no identity, --apply refused
+    ("postgresql+asyncpg://u:p@h.example/db", None, "h.example:5432"),          # default port
+    ("postgresql+asyncpg://u:p@h.example/db", "6000", None),                    # PGPORT would win -> ambiguous
+    ("postgresql+asyncpg://u:p@h.example:6543/db", "6000", "h.example:6543"),   # explicit URL port
+    ("postgresql+asyncpg://u:p@h.example/db?port=7000", "6000", "h.example:7000"),        # ?port=
+    ("postgresql+asyncpg://u:p@h.example:5432/db?port=7000", None, "h.example:7000"),     # ?port= overrides
+    ("postgresql+asyncpg://u:p@/db?host=h.example:7001", "6000", "h.example:7001"),       # ?host=h:port
+    ("postgresql+asyncpg://u:p@localhost/db?host=h.example&port=7002", None, "h.example:7002"),
+    ("postgresql+asyncpg://u:p@[::1]/db", "6000", None),
+    ("postgresql+asyncpg://u:p@[::1]/db", None, "[::1]:5432"),
+    ("postgresql+asyncpg://u:p@[::1]:6000/db", "7000", "[::1]:6000"),
+    (f"postgresql+asyncpg://u:p@{NEON}.c-2.eu-central-1.aws.neon.tech/neondb", "6000", None),
+    (f"postgresql+asyncpg://u:p@{NEON}.c-2.eu-central-1.aws.neon.tech:5432/neondb", "6000", NEON),
+    # malformed values: refused, never silently defaulted
+    ("postgresql+asyncpg://u:p@h.example:0/db", None, None),
+    ("postgresql+asyncpg://u:p@h.example/db?port=", None, None),
+    ("postgresql+asyncpg://u:p@h.example/db?port=-1", None, None),
+    ("postgresql+asyncpg://u:p@h.example/db?port=70000", None, None),
+    ("postgresql+asyncpg://u:p@h.example:99999/db", None, None),
+    ("postgresql+asyncpg://u:p@h.example/db?port=abc", None, None),
+    ("postgresql+asyncpg://u:p@h.example/db?port=1&port=2", None, None),
+    ("postgresql+asyncpg://u:p@/db?host=h.example:abc", None, None),
+]
+
+
+@pytest.mark.parametrize("url,pgport,endpoint", PORT_CASES, ids=[str(i) for i in range(len(PORT_CASES))])
+def test_effective_port_identity(url, pgport, endpoint, monkeypatch):
+    monkeypatch.delenv("PGPORT", raising=False)
+    if pgport is not None:
+        monkeypatch.setenv("PGPORT", pgport)
+    t = sc.describe_target(url)
+    assert t.endpoint == endpoint
+    if endpoint is None:
+        assert t.connect_args() == {}
+    else:
+        assert set(t.connect_args()) == {"host", "port"} and 1 <= t.connect_args()["port"] <= 65535
+
+
+@pytest.mark.parametrize("url,pgport,endpoint", [c for c in PORT_CASES if c[2] is not None],
+                         ids=[str(i) for i, c in enumerate(PORT_CASES) if c[2] is not None])
+def test_pinned_connect_args_are_what_asyncpg_dials(url, pgport, endpoint, monkeypatch):
+    """With the pinned host/port, asyncpg's own address resolution yields exactly the confirmed
+    endpoint, even with hostile PGHOST/PGPORT in the environment."""
+    import asyncpg.connect_utils as cu
+
+    monkeypatch.delenv("PGPORT", raising=False)
+    if pgport is not None:
+        monkeypatch.setenv("PGPORT", pgport)
+    t = sc.describe_target(url)
+    monkeypatch.setenv("PGPORT", "1")          # hostile environment at connect time
+    monkeypatch.setenv("PGHOST", "192.0.2.1")
+    pinned = t.connect_args()
+    addrs, _ = cu._parse_connect_dsn_and_args(
+        dsn=None, host=pinned["host"], port=pinned["port"], user="u", password=None, passfile=None,
+        database="db", ssl=None, direct_tls=None, server_settings=None, target_session_attrs=None,
+        krbsrvname=None, gsslib=None)
+    assert [tuple(a) for a in addrs] == [(t.hosts[0], t.port)]
+    if not t.neon_host:
+        host, _, port = endpoint.rpartition(":")
+        assert (host.strip("[]"), int(port)) == (t.hosts[0], t.port)
+
+
 def test_describe_target_never_raises_or_echoes_url():
     t = sc.describe_target("postgresql+asyncpg://u:s3cret@[bad")
     assert t.notes and t.endpoint is None and "s3cret" not in repr(t)
@@ -789,6 +852,111 @@ def test_cli_localhost_host_override_bypass_is_refused_before_connecting():
     assert "s3cret-pw" not in r.stdout + r.stderr and "neon.tech" not in r.stdout + r.stderr
 
 
+def _without_port(url):
+    p_ = urlsplit(url)
+    return urlunsplit((p_.scheme, f"{p_.username}:{p_.password}@{p_.hostname}", p_.path, p_.query, p_.fragment))
+
+
+def test_pgport_cannot_cause_an_identity_mismatch(db_url, monkeypatch):
+    """Finding A regression: URL without a port + PGPORT -> asyncpg would dial PGPORT while the
+    old identity claimed :5432. Now there is no identity at all and --apply is refused."""
+    real_port = urlsplit(db_url).port or 5432
+    url = _without_port(db_url)
+    monkeypatch.setenv("PGPORT", str(real_port))
+    _use(monkeypatch, url)
+    db_name = urlsplit(db_url).path.lstrip("/")
+    asked = []
+    for claimed in (f"{urlsplit(db_url).hostname}:5432/{db_name}", f"{urlsplit(db_url).hostname}:{real_port}/{db_name}"):
+        args = ["--apply", "--confirm-production", "--target", claimed]
+        assert sc.main(args, read_phrase=lambda p: asked.append(p) or p) == sc.EXIT_REFUSED
+    assert asked == [] and db(db_url)(_snapshot) == ([], [])
+    r = _cli(url, environment="development")  # dry run still allowed (read-only), but shows no identity
+    assert r.returncode == 0 and "identity NOT verifiable" in r.stdout and "PGPORT" in r.stdout, r.stdout
+
+
+def test_pinned_endpoint_ignores_hostile_pghost_and_pgport(db_url, monkeypatch):
+    monkeypatch.setenv("PGPORT", "1")
+    monkeypatch.setenv("PGHOST", "192.0.2.1")
+    _use(monkeypatch, db_url)
+    args = ["--apply", "--confirm-production", "--target", _identity(db_url)]
+    assert sc.main(args, read_phrase=lambda p: p) == sc.EXIT_OK
+    assert len(db(db_url)(_snapshot)[1]) == N_SKILLS
+
+
+def _in_thread(coro_fn):
+    """Run a coroutine on a separate thread/loop (read_phrase is called synchronously from
+    inside the seeder's running event loop)."""
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        return pool.submit(asyncio.run, coro_fn()).result()
+
+
+async def _activity(url, pid=None):
+    conn = await _raw(url)
+    try:
+        dbname = urlsplit(url).path.lstrip("/")
+        rows = await conn.fetch(
+            "SELECT pid, state, backend_xid, (SELECT count(*) FROM pg_locks l WHERE l.pid = a.pid "
+            "AND l.locktype <> 'virtualxid') AS locks FROM pg_stat_activity a "
+            "WHERE datname = $1 AND pid <> pg_backend_pid() AND ($2::int IS NULL OR pid = $2)", dbname, pid)
+        return [dict(r) for r in rows]
+    finally:
+        await conn.close()
+
+
+def test_apply_uses_the_verified_connection_and_is_idle_during_prompt(db_url, monkeypatch):
+    """Finding B: probe, confirmation and write happen on ONE connection; while the operator is
+    prompted that connection holds no transaction and no locks."""
+    _use(monkeypatch, db_url)
+    pids, during_prompt = {}, {}
+    real_probe, real_plan = sc._probe_on, sc.build_plan
+
+    async def probe(conn):
+        pids["probe"] = await conn.scalar(text("SELECT pg_backend_pid()"))
+        return await real_probe(conn)
+
+    async def plan(conn, catalog):
+        pids["write"] = await conn.scalar(text("SELECT pg_backend_pid()"))
+        return await real_plan(conn, catalog)
+
+    def prompt(phrase):
+        during_prompt["rows"] = _in_thread(lambda: _activity(db_url, pids["probe"]))
+        return phrase
+
+    monkeypatch.setattr(sc, "_probe_on", probe)
+    monkeypatch.setattr(sc, "build_plan", plan)
+    args = ["--apply", "--confirm-production", "--target", _identity(db_url)]
+    assert sc.main(args, read_phrase=prompt) == sc.EXIT_OK
+    assert pids["probe"] == pids["write"]  # the write ran on the verified connection
+    assert during_prompt["rows"] == [{"pid": pids["probe"], "state": "idle", "backend_xid": None, "locks": 0}]
+    assert len(db(db_url)(_snapshot)[1]) == N_SKILLS
+    assert asyncio.run(_activity(db_url)) == []  # closed afterwards
+
+
+@pytest.mark.parametrize("behaviour", ["wrong phrase", "no terminal", "exception", "keyboard interrupt"])
+def test_connection_closed_after_failed_confirmation(db_url, monkeypatch, behaviour):
+    _use(monkeypatch, db_url)
+
+    def prompt(phrase):
+        if behaviour == "wrong phrase":
+            return "seed something-else"
+        if behaviour == "no terminal":
+            return None
+        if behaviour == "exception":
+            raise RuntimeError("prompt failed")
+        raise KeyboardInterrupt
+
+    args = ["--apply", "--confirm-production", "--target", _identity(db_url)]
+    if behaviour == "keyboard interrupt":
+        with pytest.raises(KeyboardInterrupt):
+            sc.main(args, read_phrase=prompt)
+    else:
+        assert sc.main(args, read_phrase=prompt) in (sc.EXIT_REFUSED, sc.EXIT_DB_ERROR)
+    assert asyncio.run(_activity(db_url)) == []  # no connection left open
+    assert db(db_url)(_snapshot) == ([], [])
+
+
 def test_cli_unreachable_database_reports_class_only():
     url = "postgresql+asyncpg://nobody:s3cret-pw@127.0.0.1:1/profexia_nowhere_test"
     r = _cli(url)
@@ -815,13 +983,13 @@ def test_main_localhost_tunnel_to_managed_server_is_protected(db_url, monkeypatc
     """H1 regression: a loopback URL whose server looks managed (SSL / Neon) is protected, and a
     Neon server behind a loopback/IP host can never be written to (identity unverifiable)."""
     _use(monkeypatch, db_url)
-    real_probe = sc._probe
+    real_probe = sc._probe_on
 
-    async def managed_probe(engine):
-        actual = await real_probe(engine)
+    async def managed_probe(conn):
+        actual = await real_probe(conn)
         return sc.ServerFacts(actual.database, **facts)
 
-    monkeypatch.setattr(sc, "_probe", managed_probe)
+    monkeypatch.setattr(sc, "_probe_on", managed_probe)
     assert sc.main(["--apply"], read_phrase=lambda p: p) == sc.EXIT_REFUSED
     full = ["--apply", "--confirm-production", "--target", _identity(db_url)]
     # Neon behind a loopback host: refused outright. SSL-only: identity verifies, but the

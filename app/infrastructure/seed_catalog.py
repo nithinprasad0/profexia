@@ -15,11 +15,18 @@ write needs --apply --confirm-production --target <identity> and typing
 The identity is "<endpoint>/<database>", where <endpoint> is the Neon endpoint ID for a
 Neon hostname (ep-xxx[-pooler].<region>.neon.tech -> ep-xxx) and "<host>:<port>" for
 any other single host (the full effective host the driver dials, so two tunnels on
-different ports never share an identity). It is compared with the host the driver
-actually dials (after `?host=` overrides) and with current_database() on the server,
-then re-checked inside the write transaction. The script refuses when the identity
-cannot be verified (multiple hosts, Unix socket, no host, or a server with a Neon
-signature reached through a non-Neon hostname). The dry run prints the identity.
+different ports never share an identity). Host and port are resolved from the URL the
+way SQLAlchemy hands them to asyncpg (after `?host=` / `?port=` overrides) and are then
+pinned as explicit connection arguments, so the driver dials exactly the confirmed
+endpoint (PGHOST/PGPORT cannot redirect it). A URL without a port while PGPORT is set,
+or with an invalid port, has no identity. The script refuses when the identity cannot
+be verified (multiple hosts, Unix socket, no host, invalid/ambiguous port, or a server
+with a Neon signature reached through a non-Neon hostname). The dry run prints it.
+
+One connection is used for the whole run: the identity is read on it (READ ONLY
+transaction, then rolled back), the operator confirms while it is idle (no transaction
+and no locks are held during the prompt), and the write transaction starts on that same
+connection and re-checks the server facts before any write.
 
 Behaviour:
 - The database must be at a supported Alembic revision (0006). Nothing is migrated.
@@ -48,12 +55,14 @@ import argparse
 import asyncio
 import ipaddress
 import json
+import os
 import re
 import sys
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+from urllib.parse import parse_qsl, urlsplit
 
 from sqlalchemy import text
 from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
@@ -402,6 +411,11 @@ class Target:
     endpoint: str | None  # Neon endpoint ID, "<host>:<port>" for any other single host, None if ambiguous
     neon_host: bool
     notes: tuple[str, ...]  # informational only; nothing here makes a target "local"
+    port: int | None = None  # effective port, pinned on the connection whenever endpoint is set
+
+    def connect_args(self) -> dict:
+        """Explicit host/port for the driver, so it dials exactly the confirmed endpoint."""
+        return {"host": self.hosts[0], "port": self.port} if self.endpoint is not None else {}
 
 
 @dataclass(frozen=True)
@@ -434,6 +448,29 @@ def _is_ip(host: str) -> bool:
         return False
 
 
+def _effective_port(url, raw_ports, raw_query: str = "") -> tuple[int | None, str]:
+    """The port asyncpg will use, or (None, reason) when it cannot be determined reliably.
+    SQLAlchemy silently drops ':0' and an empty '?port=', and passes out-of-range values on;
+    asyncpg falls back to PGPORT when no port is given. All of those are refused here."""
+    if url.port is not None and not 1 <= url.port <= 65535:
+        return None, "invalid port"
+    # Check the raw query too: make_url drops blank values such as "?port=".
+    raw_values = [v for k, v in parse_qsl(raw_query, keep_blank_values=True) if k == "port"]
+    if raw_values or "port" in url.query:
+        values = raw_values or [url.query["port"]]
+        if len(values) != 1 or not (isinstance(values[0], str) and values[0].isdigit()
+                                    and 1 <= int(values[0]) <= 65535):
+            return None, "invalid port"
+    port = raw_ports[0] if isinstance(raw_ports, (list, tuple)) else raw_ports
+    if port is None:
+        if os.environ.get("PGPORT") is not None:
+            return None, "no port in the URL while PGPORT is set (effective port ambiguous)"
+        return DEFAULT_PORT, ""
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        return None, "invalid port"
+    return port, ""
+
+
 def describe_target(database_url: str) -> Target:
     """Resolve the effective host(s) with SQLAlchemy's own asyncpg argument builder, so
     `?host=` overrides and multi-host URLs are seen exactly as the driver sees them."""
@@ -460,18 +497,20 @@ def describe_target(database_url: str) -> Target:
         notes.append("unrecognised host")
     else:
         h = hosts[0].lower().strip("[]")
-        port = raw_ports[0] if isinstance(raw_ports, (list, tuple)) else raw_ports
+        port, why = _effective_port(url, raw_ports, urlsplit(database_url).query)
         match = NEON_HOST_RE.fullmatch(h)
-        if match:
+        if port is None:
+            notes.append(why)
+        elif match:
             endpoint, neon_host = match.group(1), True
             notes.append("Neon hostname")
         else:
-            endpoint = f"[{h}]:{port or DEFAULT_PORT}" if ":" in h else f"{h}:{port or DEFAULT_PORT}"
+            endpoint = f"[{h}]:{port}" if ":" in h else f"{h}:{port}"
             notes.append("loopback host (may still be a tunnel to another server)" if _is_loopback(h)
                          else "network host")
     if ssl_requested:
         notes.append("SSL requested")
-    return Target(hosts, ssl_requested, endpoint, neon_host, tuple(notes))
+    return Target(hosts, ssl_requested, endpoint, neon_host, tuple(notes), port if endpoint else None)
 
 
 async def server_facts(conn: AsyncConnection) -> ServerFacts:
@@ -499,8 +538,8 @@ def target_notes(target: Target, facts: ServerFacts, environment: str) -> list[s
 def verified_identity(target: Target, facts: ServerFacts) -> str:
     """'<endpoint>/<database>' checked against the dialled host and the server, or SeedRefused."""
     if target.endpoint is None:
-        raise SeedRefused("target identity cannot be verified (multiple hosts, Unix socket or no host); "
-                          "nothing was written")
+        raise SeedRefused("target identity cannot be verified (multiple hosts, Unix socket, no host, or an "
+                          "invalid/ambiguous port); nothing was written")
     if facts.neon and not target.neon_host:
         raise SeedRefused("a server with a Neon signature was reached through a non-Neon hostname (tunnel, "
                           "proxy or IP), so its endpoint cannot be verified; connect with the endpoint "
@@ -579,48 +618,63 @@ def _not_committed(exc: Exception) -> SeedError:
                      "the transaction was not committed, nothing was written")
 
 
-async def run(engine: AsyncEngine, catalog: Catalog, *, apply: bool, skip_conflicts: bool = False,
-              expected: ServerFacts | None = None) -> Plan:
-    """Dry runs use a READ ONLY transaction. Apply uses one transaction, committed only if
-    every step succeeds; a failed COMMIT is reported as an unknown outcome."""
+async def run_on_connection(conn: AsyncConnection, catalog: Catalog, *, apply: bool,
+                            skip_conflicts: bool = False, expected: ServerFacts | None = None) -> Plan:
+    """Run on an already-open connection that is not inside a transaction. Dry runs use a
+    READ ONLY transaction. Apply uses one transaction, committed only if every step
+    succeeds; a failed COMMIT is reported as an unknown outcome."""
     if not apply:
         try:
-            async with engine.connect() as conn:
-                await conn.execute(text("SET TRANSACTION READ ONLY"))
-                try:
-                    return await seed_in_transaction(conn, catalog, apply=False, skip_conflicts=skip_conflicts,
-                                                     expected=expected)
-                finally:
-                    await conn.rollback()
+            await conn.execute(text("SET TRANSACTION READ ONLY"))
+            try:
+                return await seed_in_transaction(conn, catalog, apply=False, skip_conflicts=skip_conflicts,
+                                                 expected=expected)
+            finally:
+                await conn.rollback()
         except DBAPIError as exc:
             raise _not_committed(exc) from None
 
-    stage, plan = "connect", None
+    stage = "begin"
     try:
-        async with engine.connect() as conn:
-            trans = await conn.begin()
-            stage = "work"
+        trans = await conn.begin()
+        stage = "work"
+        try:
+            plan = await seed_in_transaction(conn, catalog, apply=True, skip_conflicts=skip_conflicts,
+                                             expected=expected)
+        except BaseException:
             try:
-                plan = await seed_in_transaction(conn, catalog, apply=True, skip_conflicts=skip_conflicts,
-                                                 expected=expected)
-            except BaseException:
-                try:
-                    await trans.rollback()
-                except Exception:  # noqa: BLE001 - the server discards an uncommitted transaction anyway
-                    pass
-                raise
-            stage = "commit"
-            await _commit(trans)
-            stage = "committed"
+                await trans.rollback()
+            except Exception:  # noqa: BLE001 - the server discards an uncommitted transaction anyway
+                pass
+            raise
+        stage = "commit"
+        await _commit(trans)
+        return plan
     except SeedError:
         raise
     except Exception as exc:
-        if stage == "committed":  # failure while releasing the connection after a successful COMMIT
-            return plan
         if stage == "commit":
             raise SeedOutcomeUnknown(
                 f"COMMIT failed ({type(getattr(exc, 'orig', exc)).__name__}); the outcome is UNKNOWN. "
                 "Run the dry run again to see what was written (re-running is safe).") from None
+        if isinstance(exc, DBAPIError):
+            raise _not_committed(exc) from None
+        raise
+
+
+async def run(engine: AsyncEngine, catalog: Catalog, *, apply: bool, skip_conflicts: bool = False,
+              expected: ServerFacts | None = None) -> Plan:
+    """run_on_connection() on a fresh connection from `engine` (library/test entry point)."""
+    plan = None
+    try:
+        async with engine.connect() as conn:
+            plan = await run_on_connection(conn, catalog, apply=apply, skip_conflicts=skip_conflicts,
+                                           expected=expected)
+    except SeedError:
+        raise
+    except Exception as exc:
+        if plan is not None:  # failure while releasing the connection after a completed run
+            return plan
         if isinstance(exc, DBAPIError):
             raise _not_committed(exc) from None
         raise
@@ -652,13 +706,14 @@ def _print_plan(plan: Plan, *, apply: bool, out=print) -> None:
             f"conflicts: {c['conflict']}")
 
 
-async def _probe(engine: AsyncEngine) -> ServerFacts:
-    async with engine.connect() as conn:
-        await conn.execute(text("SET TRANSACTION READ ONLY"))
-        try:
-            return await server_facts(conn)
-        finally:
-            await conn.rollback()
+async def _probe_on(conn: AsyncConnection) -> ServerFacts:
+    """Read the server facts in a READ ONLY transaction, then end it: the connection is left
+    idle (no transaction, no locks) for the confirmation prompt."""
+    await conn.execute(text("SET TRANSACTION READ ONLY"))
+    try:
+        return await server_facts(conn)
+    finally:
+        await conn.rollback()
 
 
 def main(argv: list[str] | None = None, *,
@@ -678,13 +733,31 @@ def main(argv: list[str] | None = None, *,
     from app.core.config import settings
     from app.core.database import engine_options
 
-    def with_engine(fn):
-        async def go():
-            engine = create_async_engine(settings.database_url, **engine_options(settings.database_url))
+    def session(catalog: Catalog, target: Target) -> Plan:
+        options = engine_options(settings.database_url)
+        pinned = target.connect_args()
+        if pinned:  # the driver dials exactly the endpoint in the identity (PGHOST/PGPORT cannot redirect it)
+            options["connect_args"] = {**options.get("connect_args", {}), **pinned}
+
+        async def go() -> Plan:
+            engine = create_async_engine(settings.database_url, **options)
+            plan = None
             try:
-                return await fn(engine)
+                async with engine.connect() as conn:  # the ONE connection: probe, confirm, write
+                    facts = await _probe_on(conn)
+                    _show_and_confirm(target, facts)
+                    plan = await run_on_connection(conn, catalog, apply=args.apply,
+                                                   skip_conflicts=args.skip_conflicts, expected=facts)
+            except SeedError:
+                raise
+            except Exception:
+                if plan is not None:  # failure while releasing the connection after a completed run
+                    return plan
+                raise
             finally:
                 await engine.dispose()
+            return plan
+
         try:
             return asyncio.run(go())
         except SeedError:
@@ -692,13 +765,7 @@ def main(argv: list[str] | None = None, *,
         except Exception as exc:  # noqa: BLE001 - driver errors may embed host or DB names: class only
             raise SeedError(f"database unavailable or failed ({type(exc).__name__}); nothing was written") from None
 
-    try:
-        catalog = load_catalog(args.catalog)
-        target = describe_target(settings.database_url)
-        if args.apply and not (args.confirm_production and args.target):
-            raise SeedRefused("--apply also requires --confirm-production and --target IDENTITY for every "
-                              "database (run the dry run to see the identity); nothing was written")
-        facts = with_engine(_probe)
+    def _show_and_confirm(target: Target, facts: ServerFacts) -> str | None:
         notes = target_notes(target, facts, settings.environment)
         print(f"Catalogue v{catalog.version}: {len(catalog.categories)} categories, {len(catalog.skills)} skills. "
               f"Mode: {'APPLY' if args.apply else 'dry run (no writes)'}.")
@@ -716,10 +783,21 @@ def main(argv: list[str] | None = None, *,
                 raise SeedRefused(f"--target {args.target!r} does not match the connected database "
                                   f"({identity}); nothing was written")
             phrase = f"seed {identity}"
+            # Blocking prompt while the connection is idle: no transaction, no locks held.
             if read_phrase(phrase) != phrase:
                 raise SeedRefused("confirmation phrase not entered (an interactive terminal is required)")
-        plan = with_engine(lambda engine: run(engine, catalog, apply=args.apply,
-                                              skip_conflicts=args.skip_conflicts, expected=facts))
+        return identity
+
+    try:
+        catalog = load_catalog(args.catalog)
+        target = describe_target(settings.database_url)
+        if args.apply and not (args.confirm_production and args.target):
+            raise SeedRefused("--apply also requires --confirm-production and --target IDENTITY for every "
+                              "database (run the dry run to see the identity); nothing was written")
+        if args.apply and target.endpoint is None:
+            raise SeedRefused(f"target identity cannot be verified ({'; '.join(target.notes)}); "
+                              "nothing was written")
+        plan = session(catalog, target)
     except SeedConflicts as exc:
         _print_plan(exc.plan, apply=False)
         print(f"ABORTED: {exc}. Resolve the conflicts or re-run with --skip-conflicts.", file=sys.stderr)

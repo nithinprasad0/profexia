@@ -39,33 +39,60 @@ exactly like a local server.
 
 So every `--apply` requires all three of:
 1. `--confirm-production`.
-2. `--target <identity>`, where the identity is `<endpoint>/<database>`. The endpoint is worked
-   out from the host the driver **actually dials**, so `?host=` overrides in the URL are taken
-   into account:
+2. `--target <identity>`, where the identity is `<endpoint>/<database>`. The endpoint comes
+   from the host and port SQLAlchemy hands to asyncpg, so `?host=` and `?port=` overrides in
+   the URL are taken into account:
    - A Neon hostname (`ep-<id>[-pooler].<region>….neon.tech`) gives the Neon endpoint ID,
      for example `ep-example-123456`. The pooler and direct hostnames give the same ID.
    - **Any other single host** gives the full host and port, for example
-     `db.internal.example.com:5432` or `127.0.0.1:55432`. The host is never shortened, and
-     the port is included, so two tunnels on different ports never share an identity.
+     `db.internal.example.com:5432`, `127.0.0.1:55432` or `[::1]:6000`. The host is never
+     shortened, and the port is included, so two tunnels on different ports never share an
+     identity.
    - The database is `current_database()` reported by the server.
+   - **Port rules:**
+     - The port comes from the URL (`:port` or `?port=`). With no port, it is 5432.
+     - If the URL has no port **and `PGPORT` is set**, the effective port is ambiguous, so
+       there is no identity. The dry run says so and `--apply` is refused.
+     - Invalid ports are refused, never silently defaulted: `:0`, an empty or non-numeric
+       `?port=`, out-of-range values, or `port` given twice.
+   - **Pinning.** The verified host and port are passed to the driver as explicit
+     connection arguments. The driver therefore dials exactly the endpoint you confirmed;
+     `PGHOST` and `PGPORT` can't redirect it.
    - The script **refuses** when the identity can't be verified:
      - several hosts;
      - a Unix socket;
      - no host;
      - an unrecognised host;
+     - an invalid or ambiguous port;
      - a server with a Neon signature reached through a non-Neon hostname, such as a tunnel,
        proxy or IP.
    - A target that doesn't match is refused before the prompt and before any write.
 3. Typing `seed <identity>` at an interactive terminal. The phrase is specific to that target.
    Without a terminal the script refuses.
 
-The server facts (database name, SSL, Neon signature) are read once before confirmation.
-They are read **again inside the write transaction**, and any difference aborts the run.
+**One connection for the whole run.**
+1. The script opens one connection.
+2. It reads the server facts (database name, SSL, Neon signature) in a read-only
+   transaction, then ends that transaction.
+3. It prompts you while the connection is **idle**: no transaction is open and no locks are
+   held while it waits.
+4. The write transaction starts on **that same connection**. It re-reads the server facts
+   before taking locks or writing, and any difference aborts the run.
 
-**What this does *not* guarantee:** the identity proves which host and port the client dials
-and which database name the server reports. It cannot prove *where* that host and port really
-lead. The operator has to recognise the identity, and the runbook below requires using the
-Neon endpoint hostname in production, not a tunnel.
+The connection is closed on success, on refusal, on errors and on Ctrl-C. The write can't
+silently land on a different server reached by a fresh connection.
+
+**What this does *not* guarantee:**
+- **The identity doesn't prove where the endpoint leads.** It proves which host and port
+  the client dials and which database name the server reports, not *where* that host and
+  port really lead. You have to recognise the identity, and the runbook below requires
+  using the Neon endpoint hostname in production, not a tunnel.
+- **"Same connection" means the same client socket.** Through a transaction-mode pooler
+  (Neon's `-pooler` host), the pooler may hand each transaction to a different backend
+  process. They all belong to the same Neon endpoint and database.
+- **A long pause can lose the connection.** If the confirmation takes a long time, the server
+  or pooler may close the idle connection; Neon suspends idle computes. The write then fails
+  before COMMIT, so nothing is written, and you just run it again.
 
 | Exit code | Meaning |
 |---|---|
