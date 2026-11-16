@@ -47,7 +47,7 @@ On a protected database, `--apply` requires all three of:
 2. `--target <endpoint>/<database>`. This is verified against the host the driver actually
    dials and against `current_database()` on the server:
    - On Neon, the endpoint is the host's first label without `-pooler`, for example
-     `ep-late-glade-a10huyxh`.
+     `ep-example-123456`.
    - On an IP or loopback host, it is the host itself.
    - The script **refuses** when the identity can't be verified:
      - several hosts;
